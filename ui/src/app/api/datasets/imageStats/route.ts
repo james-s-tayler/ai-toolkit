@@ -13,7 +13,23 @@ export async function POST(request: Request) {
   const datasetsPath = await getDatasetsRoot();
   const body = await request.json();
   const { datasetName } = body;
+
+  // Validate datasetName
+  if (!datasetName || typeof datasetName !== 'string' || datasetName.trim() === '') {
+    return NextResponse.json({ error: 'Invalid dataset name' }, { status: 400 });
+  }
+
+  // Prevent path traversal attacks
+  if (datasetName.includes('..') || datasetName.includes('/') || datasetName.includes('\\')) {
+    return NextResponse.json({ error: 'Invalid dataset name' }, { status: 400 });
+  }
+
   const datasetFolder = path.join(datasetsPath, datasetName);
+
+  // Verify the resolved path is within datasetsPath
+  if (!datasetFolder.startsWith(datasetsPath)) {
+    return NextResponse.json({ error: 'Invalid dataset path' }, { status: 400 });
+  }
 
   try {
     // Check if folder exists
@@ -26,28 +42,34 @@ export async function POST(request: Request) {
     const totalCount = imageFiles.length;
     const resolutionBreakdown: { [resolution: string]: number } = {};
 
-    // Get resolution for each image
-    for (const imgPath of imageFiles) {
-      try {
-        const ext = path.extname(imgPath).toLowerCase();
-        // Skip video files for now as getting their resolution requires different approach
-        if (['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.m4v', '.flv'].includes(ext)) {
-          const videoKey = 'video (resolution unavailable)';
-          resolutionBreakdown[videoKey] = (resolutionBreakdown[videoKey] || 0) + 1;
-          continue;
-        }
+    // Get resolution for each image with concurrent processing
+    const CONCURRENCY_LIMIT = 10;
+    for (let i = 0; i < imageFiles.length; i += CONCURRENCY_LIMIT) {
+      const batch = imageFiles.slice(i, i + CONCURRENCY_LIMIT);
+      await Promise.allSettled(
+        batch.map(async imgPath => {
+          try {
+            const ext = path.extname(imgPath).toLowerCase();
+            // Skip video files for now as getting their resolution requires different approach
+            if (['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.m4v', '.flv'].includes(ext)) {
+              const videoKey = 'video (resolution unavailable)';
+              resolutionBreakdown[videoKey] = (resolutionBreakdown[videoKey] || 0) + 1;
+              return;
+            }
 
-        const metadata = await sharp(imgPath).metadata();
-        const width = metadata.width || 0;
-        const height = metadata.height || 0;
-        const resolution = `${width}x${height}`;
-        resolutionBreakdown[resolution] = (resolutionBreakdown[resolution] || 0) + 1;
-      } catch (error) {
-        console.error(`Error reading image metadata for ${imgPath}:`, error);
-        // If we can't read the image, count it as unknown
-        const unknownKey = 'unknown resolution';
-        resolutionBreakdown[unknownKey] = (resolutionBreakdown[unknownKey] || 0) + 1;
-      }
+            const metadata = await sharp(imgPath).metadata();
+            const width = metadata.width || 0;
+            const height = metadata.height || 0;
+            const resolution = `${width}x${height}`;
+            resolutionBreakdown[resolution] = (resolutionBreakdown[resolution] || 0) + 1;
+          } catch (error) {
+            console.error(`Error reading image metadata for ${imgPath}:`, error);
+            // If we can't read the image, count it as unknown
+            const unknownKey = 'unknown resolution';
+            resolutionBreakdown[unknownKey] = (resolutionBreakdown[unknownKey] || 0) + 1;
+          }
+        })
+      );
     }
 
     const stats: ImageStats = {

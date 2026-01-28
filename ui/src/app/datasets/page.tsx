@@ -29,26 +29,36 @@ export default function Datasets() {
 
   // Fetch image stats for each dataset
   useEffect(() => {
+    const abortController = new AbortController();
+    
     if (datasets.length > 0) {
       datasets.forEach(datasetName => {
         // Only fetch if we don't already have the stats and not currently loading
         if (!imageStats[datasetName] && !statsLoading[datasetName]) {
           setStatsLoading(prev => ({ ...prev, [datasetName]: true }));
           apiClient
-            .post('/api/datasets/imageStats', { datasetName })
+            .post('/api/datasets/imageStats', { datasetName }, { signal: abortController.signal })
             .then(res => res.data)
             .then((data: ImageStats) => {
-              setImageStats(prev => ({ ...prev, [datasetName]: data }));
-              setStatsLoading(prev => ({ ...prev, [datasetName]: false }));
+              if (!abortController.signal.aborted) {
+                setImageStats(prev => ({ ...prev, [datasetName]: data }));
+                setStatsLoading(prev => ({ ...prev, [datasetName]: false }));
+              }
             })
             .catch(error => {
-              console.error(`Error fetching image stats for ${datasetName}:`, error);
-              setStatsLoading(prev => ({ ...prev, [datasetName]: false }));
+              if (!abortController.signal.aborted) {
+                console.error(`Error fetching image stats for ${datasetName}:`, error);
+                setStatsLoading(prev => ({ ...prev, [datasetName]: false }));
+              }
             });
         }
       });
     }
-  }, [datasets]);
+
+    return () => {
+      abortController.abort();
+    };
+  }, [datasets, imageStats, statsLoading]);
 
   // Transform datasets array into rows with objects
   const tableRows = datasets.map(dataset => ({
@@ -92,11 +102,15 @@ export default function Datasets() {
         const tooltipContent = (
           <div className="text-left">
             <div className="font-semibold mb-1">Resolution Breakdown:</div>
-            {sortedResolutions.map(([resolution, count]) => (
-              <div key={resolution} className="text-xs">
-                {resolution}: {count} {count === 1 ? 'image' : 'images'}
-              </div>
-            ))}
+            {sortedResolutions.length > 0 ? (
+              sortedResolutions.map(([resolution, count]) => (
+                <div key={resolution} className="text-xs">
+                  {resolution}: {count} {count === 1 ? 'image' : 'images'}
+                </div>
+              ))
+            ) : (
+              <div className="text-xs">No images found</div>
+            )}
           </div>
         );
 
@@ -141,6 +155,11 @@ export default function Datasets() {
               const newStats = { ...prev };
               delete newStats[datasetName];
               return newStats;
+            });
+            setStatsLoading(prev => {
+              const newLoading = { ...prev };
+              delete newLoading[datasetName];
+              return newLoading;
             });
             refreshDatasets();
           })
