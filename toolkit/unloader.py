@@ -56,10 +56,7 @@ def unload_text_encoder(model: "BaseModel"):
             for encoder in encoders_to_unload:
                 # Move to CPU (capture return value for safety)
                 encoder = encoder.to('cpu')
-                # Clear all parameters and buffers
-                for param in encoder.parameters():
-                    param.data = None
-                # Delete the encoder
+                # Delete the encoder - moving to CPU already freed GPU memory
                 del encoder
             
             # Clear the temporary list
@@ -81,9 +78,6 @@ def unload_text_encoder(model: "BaseModel"):
                 if not isinstance(text_encoder_to_unload, FakeTextEncoder):
                     # Move to CPU (capture return value for safety)
                     text_encoder_to_unload = text_encoder_to_unload.to('cpu')
-                    # Clear all parameters
-                    for param in text_encoder_to_unload.parameters():
-                        param.data = None
                     # Explicitly delete the old text encoder to free system RAM
                     del text_encoder_to_unload
 
@@ -100,9 +94,6 @@ def unload_text_encoder(model: "BaseModel"):
                     if not isinstance(text_encoder_to_unload, FakeTextEncoder):
                         # Move to CPU (capture return value for safety)
                         text_encoder_to_unload = text_encoder_to_unload.to('cpu')
-                        # Clear all parameters
-                        for param in text_encoder_to_unload.parameters():
-                            param.data = None
                         # Explicitly delete the old text encoder to free system RAM
                         del text_encoder_to_unload
                 i += 1
@@ -116,9 +107,6 @@ def unload_text_encoder(model: "BaseModel"):
             # Now move old encoder to CPU to free GPU memory
             # Move to CPU (capture return value for safety)
             text_encoder_to_unload = text_encoder_to_unload.to('cpu')
-            # Clear all parameters
-            for param in text_encoder_to_unload.parameters():
-                param.data = None
             # Explicitly delete the old text encoder to free system RAM
             del text_encoder_to_unload
 
