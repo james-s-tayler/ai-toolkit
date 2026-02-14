@@ -42,7 +42,6 @@ def unload_text_encoder(model: "BaseModel"):
         if isinstance(model.text_encoder, list):
             old_text_encoder_list = model.text_encoder
             text_encoder_list = []
-            pipe = model.pipeline
 
             # Build new list and update pipeline
             for i, te in enumerate(old_text_encoder_list):
@@ -53,8 +52,8 @@ def unload_text_encoder(model: "BaseModel"):
                 # Determine pipeline attribute name
                 # text_encoder (i=0), text_encoder_2 (i=1), text_encoder_3 (i=2), etc.
                 te_attr = "text_encoder" if i == 0 else f"text_encoder_{i+1}"
-                if hasattr(pipe, te_attr):
-                    setattr(pipe, te_attr, te_fake)
+                if hasattr(model, 'pipeline') and model.pipeline is not None and hasattr(model.pipeline, te_attr):
+                    setattr(model.pipeline, te_attr, te_fake)
             
             # Replace list atomically
             model.text_encoder = text_encoder_list
@@ -73,7 +72,7 @@ def unload_text_encoder(model: "BaseModel"):
             
             # Replace in model and pipeline
             model.text_encoder = te_fake
-            if hasattr(model, 'pipeline') and hasattr(model.pipeline, 'text_encoder'):
+            if hasattr(model, 'pipeline') and model.pipeline is not None and hasattr(model.pipeline, 'text_encoder'):
                 model.pipeline.text_encoder = te_fake
             
             # Cleanup old encoder
