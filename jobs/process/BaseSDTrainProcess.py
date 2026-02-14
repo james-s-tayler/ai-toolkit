@@ -49,6 +49,7 @@ from toolkit.saving import save_t2i_from_diffusers, load_t2i_model, save_ip_adap
 from toolkit.scheduler import get_lr_scheduler
 from toolkit.sd_device_states_presets import get_train_sd_device_state_preset
 from toolkit.stable_diffusion_model import StableDiffusion
+from toolkit.unloader import unload_text_encoder
 
 from jobs.process import BaseTrainProcess
 from toolkit.metadata import get_meta_for_safetensors, load_metadata_from_safetensors, add_base_model_info_to_meta, \
@@ -2207,6 +2208,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         # For LTX-2 with sequential loading, load transformer after text embeddings are cached
         if hasattr(self.sd, 'load_transformer_deferred'):
+            # Unload text encoder before loading transformer to avoid memory spike
+            if self.train_config.unload_text_encoder or self.is_caching_text_embeddings:
+                print_acc("Unloading text encoder before loading transformer")
+                unload_text_encoder(self.sd)
+                flush()
+            
             self.sd.load_transformer_deferred()
             # After deferred loading, apply transformer configuration that was skipped earlier
             self._configure_transformer_after_deferred_load()
