@@ -832,7 +832,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def _create_network_deferred(self):
         """
         Creates the LoRA network after deferred transformer loading.
-        This is called for LTX-2 sequential loading mode.
+        This is called ONLY for LTX-2 sequential loading mode (from load_transformer_deferred flow).
         """
         if self.is_fine_tuning or self.network_config is None:
             return
@@ -842,8 +842,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
         unet = self.sd.unet
         
         # In sequential loading mode, text encoder has been unloaded (replaced with FakeTextEncoder)
-        # We cannot train it, so force train_text_encoder to False
-        train_text_encoder = False
+        # Check if text encoder is fake, and if so, disable text encoder training
+        from toolkit.unloader import FakeTextEncoder
+        if isinstance(text_encoder, list):
+            is_fake = any(isinstance(te, FakeTextEncoder) for te in text_encoder)
+        else:
+            is_fake = isinstance(text_encoder, FakeTextEncoder)
+        
+        # If text encoder is fake (unloaded), we cannot train it
+        train_text_encoder = False if is_fake else self.train_config.train_text_encoder
         
         # Network creation logic (moved from run())
         network_kwargs = self.network_config.network_kwargs
