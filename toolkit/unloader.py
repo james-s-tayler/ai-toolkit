@@ -52,7 +52,7 @@ def unload_text_encoder(model: "BaseModel"):
                 # Replace with fake encoder first to remove pipeline reference
                 pipe.text_encoder = te
                 # Now move old encoder to CPU to free GPU memory
-                old_te.to('cpu')
+                old_te = old_te.to('cpu')
                 # Explicitly delete the old text encoder to free system RAM
                 del old_te
 
@@ -65,7 +65,7 @@ def unload_text_encoder(model: "BaseModel"):
                 # Replace with fake encoder first to remove pipeline reference
                 setattr(pipe, f"text_encoder_{i}", te)
                 # Now move old encoder to CPU to free GPU memory
-                old_te.to('cpu')
+                old_te = old_te.to('cpu')
                 # Explicitly delete the old text encoder to free system RAM
                 del old_te
                 i += 1
@@ -77,7 +77,7 @@ def unload_text_encoder(model: "BaseModel"):
             # Replace with fake encoder first to remove model reference
             model.text_encoder = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
             # Now move old encoder to CPU to free GPU memory
-            old_te.to('cpu')
+            old_te = old_te.to('cpu')
             # Explicitly delete the old text encoder to free system RAM
             del old_te
 
