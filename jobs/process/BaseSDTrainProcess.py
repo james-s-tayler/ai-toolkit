@@ -782,7 +782,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return 0.0
     
     def hook_after_sd_init_before_load(self):
-        pass
+        # For LTX-2 models, enable sequential loading when text embeddings will be cached
+        # and text encoder will be unloaded. This reduces peak VRAM usage.
+        if hasattr(self.sd, '_should_load_text_encoder_first'):
+            should_unload_te = self.train_config.unload_text_encoder or self.is_caching_text_embeddings
+            if should_unload_te:
+                self.sd._should_load_text_encoder_first = True
+
 
     def get_latest_save_path(self, name=None, post=''):
         if name == None:
@@ -2021,6 +2027,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.datasets_reg is not None:
             self.data_loader_reg = get_dataloader_from_datasets(self.datasets_reg, self.train_config.batch_size,
                                                                 self.sd)
+
+        # For LTX-2 with sequential loading, load transformer after text embeddings are cached
+        if hasattr(self.sd, 'load_transformer_deferred'):
+            self.sd.load_transformer_deferred()
 
         flush()
         self.last_save_step = self.step_num

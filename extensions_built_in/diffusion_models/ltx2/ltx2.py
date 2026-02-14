@@ -216,6 +216,10 @@ class LTX2Model(BaseModel):
         
         # gemma needs left side padding
         self.te_padding_side = "left"
+        
+        # Flag to control sequential loading order for reducing peak VRAM
+        # When True, loads text encoder first, then transformer after embeddings are cached
+        self._should_load_text_encoder_first = False
 
     # static method to get the noise scheduler
     @staticmethod
@@ -225,72 +229,11 @@ class LTX2Model(BaseModel):
     def get_bucket_divisibility(self):
         return 32
 
-    def load_model(self):
-        dtype = self.torch_dtype
-        self.print_and_status_update("Loading LTX2 model")
-        model_path = self.model_config.name_or_path
-        base_model_path = self.model_config.extras_name_or_path
-
-        combined_state_dict = None
-
-        self.print_and_status_update("Loading transformer")
-        # if we have a safetensors file it is a mono checkpoint
-        if os.path.exists(model_path) and model_path.endswith(".safetensors"):
-            combined_state_dict = load_file(model_path)
-            combined_state_dict = dequantize_state_dict(combined_state_dict)
-
-        if combined_state_dict is not None:
-            original_dit_ckpt = get_model_state_dict_from_combined_ckpt(
-                combined_state_dict, dit_prefix
-            )
-            transformer = convert_ltx2_transformer(original_dit_ckpt)
-            transformer = transformer.to(dtype)
-        else:
-            transformer_path = model_path
-            transformer_subfolder = "transformer"
-            if os.path.exists(transformer_path):
-                transformer_subfolder = None
-                transformer_path = os.path.join(transformer_path, "transformer")
-                # check if the path is a full checkpoint.
-                te_folder_path = os.path.join(model_path, "text_encoder")
-                # if we have the te, this folder is a full checkpoint, use it as the base
-                if os.path.exists(te_folder_path):
-                    base_model_path = model_path
-
-            transformer = LTX2VideoTransformer3DModel.from_pretrained(
-                transformer_path, subfolder=transformer_subfolder, torch_dtype=dtype
-            )
-
-        if self.model_config.quantize:
-            self.print_and_status_update("Quantizing Transformer")
-            quantize_model(self, transformer)
-            flush()
-
-        if (
-            self.model_config.layer_offloading
-            and self.model_config.layer_offloading_transformer_percent > 0
-        ):
-            ignore_modules = []
-            for block in transformer.transformer_blocks:
-                ignore_modules.append(block.scale_shift_table)
-                ignore_modules.append(block.audio_scale_shift_table)
-                ignore_modules.append(block.video_a2v_cross_attn_scale_shift_table)
-                ignore_modules.append(block.audio_a2v_cross_attn_scale_shift_table)
-            ignore_modules.append(transformer.scale_shift_table)
-            ignore_modules.append(transformer.audio_scale_shift_table)
-            MemoryManager.attach(
-                transformer,
-                self.device_torch,
-                offload_percent=self.model_config.layer_offloading_transformer_percent,
-                ignore_modules=ignore_modules,
-            )
-
-        if self.model_config.low_vram:
-            self.print_and_status_update("Moving transformer to CPU")
-            transformer.to("cpu")
-
-        flush()
-
+    def _load_text_encoder_and_tokenizer(self, base_model_path, dtype):
+        """
+        Helper method to load text encoder and tokenizer.
+        Returns (text_encoder, tokenizer).
+        """
         self.print_and_status_update("Loading text encoder")
         if (
             self.model_config.te_name_or_path is not None
@@ -408,6 +351,80 @@ class LTX2Model(BaseModel):
             freeze(text_encoder)
             flush()
 
+        return text_encoder, tokenizer
+
+    def _load_transformer(self, model_path, combined_state_dict, dtype):
+        """
+        Helper method to load transformer.
+        Returns (transformer, updated_combined_state_dict, base_model_path).
+        """
+        self.print_and_status_update("Loading transformer")
+        base_model_path = self.model_config.extras_name_or_path
+        
+        # if we have a safetensors file it is a mono checkpoint
+        if combined_state_dict is None and os.path.exists(model_path) and model_path.endswith(".safetensors"):
+            combined_state_dict = load_file(model_path)
+            combined_state_dict = dequantize_state_dict(combined_state_dict)
+
+        if combined_state_dict is not None:
+            original_dit_ckpt = get_model_state_dict_from_combined_ckpt(
+                combined_state_dict, dit_prefix
+            )
+            transformer = convert_ltx2_transformer(original_dit_ckpt)
+            transformer = transformer.to(dtype)
+        else:
+            transformer_path = model_path
+            transformer_subfolder = "transformer"
+            if os.path.exists(transformer_path):
+                transformer_subfolder = None
+                transformer_path = os.path.join(transformer_path, "transformer")
+                # check if the path is a full checkpoint.
+                te_folder_path = os.path.join(model_path, "text_encoder")
+                # if we have the te, this folder is a full checkpoint, use it as the base
+                if os.path.exists(te_folder_path):
+                    base_model_path = model_path
+
+            transformer = LTX2VideoTransformer3DModel.from_pretrained(
+                transformer_path, subfolder=transformer_subfolder, torch_dtype=dtype
+            )
+
+        if self.model_config.quantize:
+            self.print_and_status_update("Quantizing Transformer")
+            quantize_model(self, transformer)
+            flush()
+
+        if (
+            self.model_config.layer_offloading
+            and self.model_config.layer_offloading_transformer_percent > 0
+        ):
+            ignore_modules = []
+            for block in transformer.transformer_blocks:
+                ignore_modules.append(block.scale_shift_table)
+                ignore_modules.append(block.audio_scale_shift_table)
+                ignore_modules.append(block.video_a2v_cross_attn_scale_shift_table)
+                ignore_modules.append(block.audio_a2v_cross_attn_scale_shift_table)
+            ignore_modules.append(transformer.scale_shift_table)
+            ignore_modules.append(transformer.audio_scale_shift_table)
+            MemoryManager.attach(
+                transformer,
+                self.device_torch,
+                offload_percent=self.model_config.layer_offloading_transformer_percent,
+                ignore_modules=ignore_modules,
+            )
+
+        if self.model_config.low_vram:
+            self.print_and_status_update("Moving transformer to CPU")
+            transformer.to("cpu")
+
+        flush()
+        
+        return transformer, combined_state_dict, base_model_path
+
+    def _load_vaes_and_components(self, combined_state_dict, base_model_path, dtype):
+        """
+        Helper method to load VAEs and other components.
+        Returns (vae, audio_vae, connectors, vocoder).
+        """
         self.print_and_status_update("Loading VAEs and other components")
         if combined_state_dict is not None:
             original_vae_ckpt = get_model_state_dict_from_combined_ckpt(
@@ -447,55 +464,175 @@ class LTX2Model(BaseModel):
             vocoder = LTX2Vocoder.from_pretrained(
                 base_model_path, subfolder="vocoder", torch_dtype=dtype
             )
+        
+        return vae, audio_vae, connectors, vocoder
 
-        self.noise_scheduler = LTX2Model.get_train_scheduler()
+    def load_model(self):
+        dtype = self.torch_dtype
+        self.print_and_status_update("Loading LTX2 model")
+        model_path = self.model_config.name_or_path
+        base_model_path = self.model_config.extras_name_or_path
 
-        self.print_and_status_update("Making pipe")
+        combined_state_dict = None
 
-        pipe: LTX2Pipeline = LTX2Pipeline(
-            scheduler=self.noise_scheduler,
-            vae=vae,
-            audio_vae=audio_vae,
-            text_encoder=None,
-            tokenizer=tokenizer,
-            connectors=connectors,
-            transformer=None,
-            vocoder=vocoder,
-        )
-        # for quantization, it works best to do these after making the pipe
-        pipe.text_encoder = text_encoder
-        pipe.transformer = transformer
+        # Sequential loading mode: Load text encoder first to reduce peak VRAM
+        # This is useful when caching text embeddings with unload_text_encoder enabled
+        if self._should_load_text_encoder_first:
+            self.print_and_status_update("Using sequential loading mode to reduce peak VRAM")
+            
+            # Step 1: Load text encoder only
+            text_encoder, tokenizer = self._load_text_encoder_and_tokenizer(base_model_path, dtype)
+            
+            # Step 2: Load VAEs and components (lightweight)
+            # Note: We need to check for combined_state_dict first
+            if os.path.exists(model_path) and model_path.endswith(".safetensors"):
+                combined_state_dict = load_file(model_path)
+                combined_state_dict = dequantize_state_dict(combined_state_dict)
+                # Update base_model_path if needed
+                te_folder_path = os.path.join(model_path, "text_encoder")
+                if os.path.exists(te_folder_path):
+                    base_model_path = model_path
+            
+            vae, audio_vae, connectors, vocoder = self._load_vaes_and_components(combined_state_dict, base_model_path, dtype)
+            
+            # Step 3: Create pipeline with text encoder but WITHOUT transformer yet
+            # This allows text embeddings to be cached before transformer is loaded
+            self.noise_scheduler = LTX2Model.get_train_scheduler()
+            
+            self.print_and_status_update("Making initial pipe (text encoder only)")
+            pipe: LTX2Pipeline = LTX2Pipeline(
+                scheduler=self.noise_scheduler,
+                vae=vae,
+                audio_vae=audio_vae,
+                text_encoder=None,
+                tokenizer=tokenizer,
+                connectors=connectors,
+                transformer=None,  # Will be loaded later
+                vocoder=vocoder,
+            )
+            pipe.text_encoder = text_encoder
+            
+            text_encoder = [pipe.text_encoder]
+            tokenizer = [pipe.tokenizer]
+            
+            # Ensure text encoder is on the right device
+            text_encoder[0].to(self.device_torch)
+            text_encoder[0].requires_grad_(False)
+            text_encoder[0].eval()
+            flush()
+            
+            # Save partial model state (without transformer)
+            self.vae = ComboVae(pipe.vae, pipe.audio_vae)
+            self.text_encoder = text_encoder
+            self.tokenizer = tokenizer
+            self.model = None  # Will be set after transformer loads
+            self.pipeline = pipe
+            
+            self.audio_processor = AudioProcessor(
+                sample_rate=pipe.audio_sampling_rate,
+                mel_bins=audio_vae.config.mel_bins,
+                mel_hop_length=pipe.audio_hop_length,
+                n_fft=1024,
+            ).to(self.device_torch, dtype=torch.float32)
+            
+            self.print_and_status_update("Text encoder loaded - ready for embedding cache")
+            # Transformer will be loaded later via load_transformer_deferred()
+            
+        else:
+            # Standard loading mode: Load everything in original order
+            # Step 1: Load transformer
+            transformer, combined_state_dict, base_model_path = self._load_transformer(model_path, combined_state_dict, dtype)
+            
+            # Step 2: Load text encoder
+            text_encoder, tokenizer = self._load_text_encoder_and_tokenizer(base_model_path, dtype)
+            
+            # Step 3: Load VAEs and other components
+            vae, audio_vae, connectors, vocoder = self._load_vaes_and_components(combined_state_dict, base_model_path, dtype)
+            
+            self.noise_scheduler = LTX2Model.get_train_scheduler()
 
-        self.print_and_status_update("Preparing Model")
+            self.print_and_status_update("Making pipe")
 
-        text_encoder = [pipe.text_encoder]
-        tokenizer = [pipe.tokenizer]
+            pipe: LTX2Pipeline = LTX2Pipeline(
+                scheduler=self.noise_scheduler,
+                vae=vae,
+                audio_vae=audio_vae,
+                text_encoder=None,
+                tokenizer=tokenizer,
+                connectors=connectors,
+                transformer=None,
+                vocoder=vocoder,
+            )
+            # for quantization, it works best to do these after making the pipe
+            pipe.text_encoder = text_encoder
+            pipe.transformer = transformer
 
-        # leave it on cpu for now
+            self.print_and_status_update("Preparing Model")
+
+            text_encoder = [pipe.text_encoder]
+            tokenizer = [pipe.tokenizer]
+
+            # leave it on cpu for now
+            if not self.low_vram:
+                pipe.transformer = pipe.transformer.to(self.device_torch)
+
+            flush()
+            # just to make sure everything is on the right device and dtype
+            text_encoder[0].to(self.device_torch)
+            text_encoder[0].requires_grad_(False)
+            text_encoder[0].eval()
+            flush()
+
+            # save it to the model class
+            self.vae = ComboVae(pipe.vae, pipe.audio_vae)
+            self.text_encoder = text_encoder  # list of text encoders
+            self.tokenizer = tokenizer  # list of tokenizers
+            self.model = pipe.transformer
+            self.pipeline = pipe
+
+            self.audio_processor = AudioProcessor(
+                sample_rate=pipe.audio_sampling_rate,
+                mel_bins=audio_vae.config.mel_bins,
+                mel_hop_length=pipe.audio_hop_length,
+                n_fft=1024,  # todo get this from vae if we can, I couldnt find it.
+            ).to(self.device_torch, dtype=torch.float32)
+
+            self.print_and_status_update("Model Loaded")
+
+    def load_transformer_deferred(self):
+        """
+        Loads the transformer in a deferred manner after text embeddings have been cached.
+        This should only be called when _should_load_text_encoder_first is True.
+        """
+        if not self._should_load_text_encoder_first:
+            # Transformer already loaded in standard mode
+            return
+        
+        if self.model is not None:
+            # Transformer already loaded
+            return
+        
+        dtype = self.torch_dtype
+        model_path = self.model_config.name_or_path
+        
+        self.print_and_status_update("Loading transformer (deferred)")
+        
+        # Load transformer
+        combined_state_dict = None
+        transformer, _, _ = self._load_transformer(model_path, combined_state_dict, dtype)
+        
+        # Add transformer to pipeline
+        self.pipeline.transformer = transformer
+        
+        # Move to device if not low_vram
         if not self.low_vram:
-            pipe.transformer = pipe.transformer.to(self.device_torch)
-
+            self.pipeline.transformer = self.pipeline.transformer.to(self.device_torch)
+        
         flush()
-        # just to make sure everything is on the right device and dtype
-        text_encoder[0].to(self.device_torch)
-        text_encoder[0].requires_grad_(False)
-        text_encoder[0].eval()
-        flush()
-
-        # save it to the model class
-        self.vae = ComboVae(pipe.vae, pipe.audio_vae)
-        self.text_encoder = text_encoder  # list of text encoders
-        self.tokenizer = tokenizer  # list of tokenizers
-        self.model = pipe.transformer
-        self.pipeline = pipe
-
-        self.audio_processor = AudioProcessor(
-            sample_rate=pipe.audio_sampling_rate,
-            mel_bins=audio_vae.config.mel_bins,
-            mel_hop_length=pipe.audio_hop_length,
-            n_fft=1024,  # todo get this from vae if we can, I couldnt find it.
-        ).to(self.device_torch, dtype=torch.float32)
-
+        
+        # Update model reference
+        self.model = self.pipeline.transformer
+        
         self.print_and_status_update("Model Loaded")
 
     @torch.no_grad()
