@@ -827,7 +827,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         unet.to(self.device_torch, dtype=dtype)
         unet.requires_grad_(False)
         unet.eval()
-    
+
     def _create_network_deferred(self):
         """
         Creates the LoRA network after deferred transformer loading.
@@ -954,8 +954,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self.network,
                 self.device_torch
             )
-
-
 
     def get_latest_save_path(self, name=None, post=''):
         if name == None:
