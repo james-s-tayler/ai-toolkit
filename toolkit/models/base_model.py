@@ -1449,15 +1449,18 @@ class BaseModel:
         else:
             self.vae.eval()
         self.vae.to(state['vae']['device'])
-        if state['unet']['training']:
-            self.unet.train()
-        else:
-            self.unet.eval()
-        self.unet.to(state['unet']['device'])
-        if state['unet']['requires_grad']:
-            self.unet.requires_grad_(True)
-        else:
-            self.unet.requires_grad_(False)
+        
+        # Skip unet/transformer operations if not loaded yet (sequential loading)
+        if self.unet is not None:
+            if state['unet']['training']:
+                self.unet.train()
+            else:
+                self.unet.eval()
+            self.unet.to(state['unet']['device'])
+            if state['unet']['requires_grad']:
+                self.unet.requires_grad_(True)
+            else:
+                self.unet.requires_grad_(False)
         if isinstance(self.text_encoder, list):
             for i, encoder in enumerate(self.text_encoder):
                 if isinstance(state['text_encoder'], list):

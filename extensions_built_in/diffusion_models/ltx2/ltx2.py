@@ -500,11 +500,13 @@ class LTX2Model(BaseModel):
         if self._should_load_text_encoder_first:
             self.print_and_status_update("Using sequential loading mode to reduce peak VRAM")
             
-            # Step 1: Load text encoder only
+            # Step 1: Determine paths and load combined state dict if needed
+            combined_state_dict, base_model_path = self._load_combined_state_dict_if_needed(model_path)
+            
+            # Step 2: Load text encoder only
             text_encoder, tokenizer = self._load_text_encoder_and_tokenizer(base_model_path, dtype)
             
-            # Step 2: Load VAEs and components (lightweight)
-            combined_state_dict, base_model_path = self._load_combined_state_dict_if_needed(model_path)
+            # Step 3: Load VAEs and components (lightweight)
             vae, audio_vae, connectors, vocoder = self._load_vaes_and_components(combined_state_dict, base_model_path, dtype)
             
             # Step 3: Create pipeline with text encoder but WITHOUT transformer yet
