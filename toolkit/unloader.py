@@ -54,8 +54,8 @@ def unload_text_encoder(model: "BaseModel"):
             
             # Now unload the stored encoders
             for encoder in encoders_to_unload:
-                # Move to CPU
-                encoder.to('cpu')
+                # Move to CPU (capture return value for safety)
+                encoder = encoder.to('cpu')
                 # Clear all parameters and buffers
                 for param in encoder.parameters():
                     param.data = None
@@ -79,14 +79,13 @@ def unload_text_encoder(model: "BaseModel"):
                 pipe.text_encoder = te
                 # Now move old encoder to CPU to free GPU memory (if not already fake)
                 if not isinstance(text_encoder_to_unload, FakeTextEncoder):
-                    # Move to CPU
-                    text_encoder_to_unload.to('cpu')
+                    # Move to CPU (capture return value for safety)
+                    text_encoder_to_unload = text_encoder_to_unload.to('cpu')
                     # Clear all parameters
                     for param in text_encoder_to_unload.parameters():
                         param.data = None
                     # Explicitly delete the old text encoder to free system RAM
                     del text_encoder_to_unload
-                    text_encoder_to_unload = None
 
             i = 2
             while hasattr(pipe, f"text_encoder_{i}"):
@@ -99,14 +98,13 @@ def unload_text_encoder(model: "BaseModel"):
                     setattr(pipe, f"text_encoder_{i}", te)
                     # Now move old encoder to CPU to free GPU memory (if not already fake)
                     if not isinstance(text_encoder_to_unload, FakeTextEncoder):
-                        # Move to CPU
-                        text_encoder_to_unload.to('cpu')
+                        # Move to CPU (capture return value for safety)
+                        text_encoder_to_unload = text_encoder_to_unload.to('cpu')
                         # Clear all parameters
                         for param in text_encoder_to_unload.parameters():
                             param.data = None
                         # Explicitly delete the old text encoder to free system RAM
                         del text_encoder_to_unload
-                        text_encoder_to_unload = None
                 i += 1
             model.text_encoder = text_encoder_list
         else:
@@ -116,20 +114,18 @@ def unload_text_encoder(model: "BaseModel"):
             # Replace with fake encoder first to remove model reference
             model.text_encoder = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
             # Now move old encoder to CPU to free GPU memory
-            # Move to CPU
-            text_encoder_to_unload.to('cpu')
+            # Move to CPU (capture return value for safety)
+            text_encoder_to_unload = text_encoder_to_unload.to('cpu')
             # Clear all parameters
             for param in text_encoder_to_unload.parameters():
                 param.data = None
             # Explicitly delete the old text encoder to free system RAM
             del text_encoder_to_unload
-            text_encoder_to_unload = None
 
     # Also clear tokenizer references if they exist (can be large)
     if hasattr(model, 'tokenizer') and model.tokenizer is not None:
         if isinstance(model.tokenizer, list):
-            for tok in model.tokenizer:
-                del tok
+            # Clear the list directly
             model.tokenizer.clear()
             # Replace with minimal placeholder
             model.tokenizer = [None]
@@ -144,11 +140,11 @@ def unload_text_encoder(model: "BaseModel"):
         if hasattr(pipe, 'tokenizer'):
             pipe.tokenizer = None
         # Clear connectors (text-related) from pipeline  
-        if hasattr(pipe, 'connectors'):
-            if pipe.connectors is not None:
-                pipe.connectors.to('cpu')
-                del pipe.connectors
+        if hasattr(pipe, 'connectors') and pipe.connectors is not None:
+            # Move to CPU and capture return
+            connectors_to_delete = pipe.connectors.to('cpu')
             pipe.connectors = None
+            del connectors_to_delete
 
     # Aggressively free memory
     flush()
