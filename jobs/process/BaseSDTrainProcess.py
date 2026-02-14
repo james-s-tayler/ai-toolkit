@@ -827,6 +827,133 @@ class BaseSDTrainProcess(BaseTrainProcess):
         unet.to(self.device_torch, dtype=dtype)
         unet.requires_grad_(False)
         unet.eval()
+    
+    def _create_network_deferred(self):
+        """
+        Creates the LoRA network after deferred transformer loading.
+        This is called for LTX-2 sequential loading mode.
+        """
+        if self.is_fine_tuning or self.network_config is None:
+            return
+        
+        dtype = get_torch_dtype(self.train_config.dtype)
+        text_encoder = self.sd.text_encoder
+        unet = self.sd.unet
+        
+        # Network creation logic (moved from run())
+        network_kwargs = self.network_config.network_kwargs
+        is_lycoris = False
+        is_lorm = self.network_config.type.lower() == 'lorm'
+        NetworkClass = LoRASpecialNetwork
+        if self.network_config.type.lower() == 'locon' or self.network_config.type.lower() == 'lycoris':
+            NetworkClass = LycorisSpecialNetwork
+            is_lycoris = True
+
+        if is_lorm:
+            network_kwargs['ignore_if_contains'] = lorm_ignore_if_contains
+            network_kwargs['parameter_threshold'] = lorm_parameter_threshold
+            network_kwargs['target_lin_modules'] = LORM_TARGET_REPLACE_MODULE
+        
+        if hasattr(self.sd, 'target_lora_modules'):
+            network_kwargs['target_lin_modules'] = self.sd.target_lora_modules
+
+        self.network = NetworkClass(
+            text_encoder=text_encoder,
+            unet=self.sd.get_model_to_train(),
+            lora_dim=self.network_config.linear,
+            multiplier=1.0,
+            alpha=self.network_config.linear_alpha,
+            train_unet=self.train_config.train_unet,
+            train_text_encoder=self.train_config.train_text_encoder,
+            conv_lora_dim=self.network_config.conv,
+            conv_alpha=self.network_config.conv_alpha,
+            is_sdxl=self.model_config.is_xl or self.model_config.is_ssd,
+            is_v2=self.model_config.is_v2,
+            is_v3=self.model_config.is_v3,
+            is_pixart=self.model_config.is_pixart,
+            is_auraflow=self.model_config.is_auraflow,
+            is_flux=self.model_config.is_flux,
+            is_lumina2=self.model_config.is_lumina2,
+            is_ssd=self.model_config.is_ssd,
+            is_vega=self.model_config.is_vega,
+            dropout=self.network_config.dropout,
+            use_text_encoder_1=self.model_config.use_text_encoder_1,
+            use_text_encoder_2=self.model_config.use_text_encoder_2,
+            use_bias=is_lorm,
+            is_lorm=is_lorm,
+            network_config=self.network_config,
+            network_type=self.network_config.type,
+            transformer_only=self.network_config.transformer_only,
+            is_transformer=self.sd.is_transformer,
+            base_model=self.sd,
+            **network_kwargs
+        )
+
+        self.network.force_to(self.device_torch, dtype=torch.float32)
+        self.sd.network = self.network
+        self.network._update_torch_multiplier()
+
+        self.network.apply_to(
+            text_encoder,
+            unet,
+            self.train_config.train_text_encoder,
+            self.train_config.train_unet
+        )
+
+        if self.model_config.quantize or self.model_config.layer_offloading:
+            self.network.can_merge_in = False
+
+        if is_lorm:
+            self.network.is_lorm = True
+            self.sd.unet.to(self.sd.device, dtype=dtype)
+            original_unet_param_count = count_parameters(self.sd.unet)
+            self.network.setup_lorm()
+            new_unet_param_count = original_unet_param_count - self.network.calculate_lorem_parameter_reduction()
+
+            print_lorm_extract_details(
+                start_num_params=original_unet_param_count,
+                end_num_params=new_unet_param_count,
+                num_replaced=len(self.network.get_all_modules()),
+            )
+
+        self.network.prepare_grad_etc(text_encoder, unet)
+        flush()
+
+        # Add network parameters to optimizer params
+        config = {
+            'text_encoder_lr': self.train_config.lr,
+            'unet_lr': self.train_config.lr,
+        }
+        sig = inspect.signature(self.network.prepare_optimizer_params)
+        if 'default_lr' in sig.parameters:
+            config['default_lr'] = self.train_config.lr
+        if 'learning_rate' in sig.parameters:
+            config['learning_rate'] = self.train_config.lr
+        params_net = self.network.prepare_optimizer_params(**config)
+        
+        # Add to self.params which will be used for optimizer
+        self.params += params_net
+
+        if self.train_config.gradient_checkpointing:
+            self.network.enable_gradient_checkpointing()
+
+        lora_name = self.name
+        if self.named_lora:
+            lora_name = f"{lora_name}_LoRA"
+
+        latest_save_path = self.get_latest_save_path(lora_name)
+        extra_weights = None
+        if latest_save_path is not None:
+            print_acc(f"#### IMPORTANT RESUMING FROM {latest_save_path} ####")
+            print_acc(f"Loading from {latest_save_path}")
+            extra_weights = self.load_weights(latest_save_path)
+            self.network.multiplier = 1.0
+        
+        if self.network_config.layer_offloading:
+            MemoryManager.attach(
+                self.network,
+                self.device_torch
+            )
 
 
 
@@ -1764,7 +1891,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         self.hook_after_model_load()
         flush()
-        if not self.is_fine_tuning:
+        
+        # For LTX-2 sequential loading, defer network creation until after transformer is loaded
+        should_defer_network_creation = (
+            hasattr(self.sd, '_should_load_text_encoder_first') and 
+            self.sd._should_load_text_encoder_first and 
+            self.sd.model is None
+        )
+        
+        if not self.is_fine_tuning and not should_defer_network_creation:
             if self.network_config is not None:
                 # TODO should we completely switch to LycorisSpecialNetwork?
                 network_kwargs = self.network_config.network_kwargs
@@ -2077,6 +2212,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.sd.load_transformer_deferred()
             # After deferred loading, apply transformer configuration that was skipped earlier
             self._configure_transformer_after_deferred_load()
+            # Create network after transformer is loaded (if it was deferred)
+            self._create_network_deferred()
 
         flush()
         self.last_save_step = self.step_num
