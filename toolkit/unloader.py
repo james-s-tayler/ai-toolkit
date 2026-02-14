@@ -110,23 +110,15 @@ def unload_text_encoder(model: "BaseModel"):
             # Explicitly delete the old text encoder to free system RAM
             del text_encoder_to_unload
 
-    # Also clear tokenizer references if they exist (can be large)
-    if hasattr(model, 'tokenizer') and model.tokenizer is not None:
-        if isinstance(model.tokenizer, list):
-            # Clear the list directly
-            model.tokenizer.clear()
-            # Replace with minimal placeholder
-            model.tokenizer = [None]
-        else:
-            del model.tokenizer
-            model.tokenizer = None
+    # Note: We do NOT clear tokenizer references here because:
+    # 1. Tokenizers are relatively small (vocab lookup tables)
+    # 2. They're needed during training for prompt encoding
+    # 3. The text encoder itself is the large component we're freeing
     
     # Clear any cached text-related components from pipeline
     if hasattr(model, 'pipeline') and model.pipeline is not None:
         pipe = model.pipeline
-        # Clear tokenizer from pipeline
-        if hasattr(pipe, 'tokenizer'):
-            pipe.tokenizer = None
+        # Note: Keep tokenizer - it's needed for training and is relatively small
         # Clear connectors (text-related) from pipeline  
         if hasattr(pipe, 'connectors') and pipe.connectors is not None:
             # Move to CPU and capture return
