@@ -1,3 +1,4 @@
+import gc
 import torch
 from toolkit.basic import flush
 from typing import TYPE_CHECKING
@@ -40,25 +41,99 @@ def unload_text_encoder(model: "BaseModel"):
 
     if model.text_encoder is not None:
         if isinstance(model.text_encoder, list):
+            # For models with text encoder as a list
+            # Store references to all encoders before clearing the list
+            encoders_to_unload = []
+            for encoder in model.text_encoder:
+                # Keep track of real encoders (not fakes) that need unloading
+                if not isinstance(encoder, FakeTextEncoder):
+                    encoders_to_unload.append(encoder)
+            
+            # Clear the list first to remove all references
+            model.text_encoder.clear()
+            
+            # Now unload the stored encoders
+            for encoder in encoders_to_unload:
+                # Move to CPU (capture return value for safety)
+                encoder = encoder.to('cpu')
+                # Delete the encoder - moving to CPU already freed GPU memory
+                del encoder
+            
+            # Clear the temporary list
+            encoders_to_unload.clear()
+            del encoders_to_unload
+            
             text_encoder_list = []
             pipe = model.pipeline
 
             # the pipeline stores text encoders like text_encoder, text_encoder_2, text_encoder_3, etc.
-            if hasattr(pipe, "text_encoder"):
+            if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
+                # Store reference to old encoder before replacing
+                text_encoder_to_unload = pipe.text_encoder
                 te = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
                 text_encoder_list.append(te)
-                pipe.text_encoder.to('cpu')
+                # Replace with fake encoder first to remove pipeline reference
                 pipe.text_encoder = te
+                # Now move old encoder to CPU to free GPU memory (if not already fake)
+                if not isinstance(text_encoder_to_unload, FakeTextEncoder):
+                    # Move to CPU (capture return value for safety)
+                    text_encoder_to_unload = text_encoder_to_unload.to('cpu')
+                    # Explicitly delete the old text encoder to free system RAM
+                    del text_encoder_to_unload
 
             i = 2
             while hasattr(pipe, f"text_encoder_{i}"):
-                te = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
-                text_encoder_list.append(te)
-                setattr(pipe, f"text_encoder_{i}", te)
+                # Store reference to old encoder before replacing
+                text_encoder_to_unload = getattr(pipe, f"text_encoder_{i}")
+                if text_encoder_to_unload is not None:
+                    te = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
+                    text_encoder_list.append(te)
+                    # Replace with fake encoder first to remove pipeline reference
+                    setattr(pipe, f"text_encoder_{i}", te)
+                    # Now move old encoder to CPU to free GPU memory (if not already fake)
+                    if not isinstance(text_encoder_to_unload, FakeTextEncoder):
+                        # Move to CPU (capture return value for safety)
+                        text_encoder_to_unload = text_encoder_to_unload.to('cpu')
+                        # Explicitly delete the old text encoder to free system RAM
+                        del text_encoder_to_unload
                 i += 1
             model.text_encoder = text_encoder_list
         else:
             # only has a single text encoder
+            # Store reference to old encoder before replacing
+            text_encoder_to_unload = model.text_encoder
+            # Replace with fake encoder first to remove model reference
             model.text_encoder = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
+            # Now move old encoder to CPU to free GPU memory
+            # Move to CPU (capture return value for safety)
+            text_encoder_to_unload = text_encoder_to_unload.to('cpu')
+            # Explicitly delete the old text encoder to free system RAM
+            del text_encoder_to_unload
 
+    # Note: We do NOT clear tokenizer references here because:
+    # 1. Tokenizers are relatively small (vocab lookup tables)
+    # 2. They're needed during training for prompt encoding
+    # 3. The text encoder itself is the large component we're freeing
+    
+    # Clear any cached text-related components from pipeline
+    if hasattr(model, 'pipeline') and model.pipeline is not None:
+        pipe = model.pipeline
+        # Note: Keep tokenizer - it's needed for training and is relatively small
+        # Clear connectors (text-related) from pipeline  
+        if hasattr(pipe, 'connectors') and pipe.connectors is not None:
+            # Move to CPU and capture return
+            connectors_to_delete = pipe.connectors.to('cpu')
+            pipe.connectors = None
+            del connectors_to_delete
+
+    # Aggressively free memory
     flush()
+    # Force full garbage collection including all generations
+    # Multiple passes help clean up circular references in large model graphs
+    gc.collect(2)  # Collect generation 2 (oldest objects)
+    gc.collect(2)  # Second pass to catch any newly unreachable objects
+    gc.collect(2)  # Third pass for good measure
+    torch.cuda.empty_cache()
+    # Final sync to ensure GPU operations complete
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
