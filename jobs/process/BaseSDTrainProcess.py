@@ -789,13 +789,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if should_unload_te:
                 self.sd._should_load_text_encoder_first = True
     
-    def _configure_unet_after_deferred_load(self):
+    def _configure_transformer_after_deferred_load(self):
         """
-        Applies unet configuration after deferred transformer loading.
+        Applies transformer/unet configuration after deferred transformer loading.
         This is called for LTX-2 sequential loading mode.
+        The method uses 'unet' terminology for compatibility with the base model's property,
+        but applies to the LTX-2 transformer.
         """
         if self.sd.unet is None:
-            # No unet to configure
+            # No unet/transformer to configure
             return
         
         dtype = get_torch_dtype(self.train_config.dtype)
@@ -2073,8 +2075,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # For LTX-2 with sequential loading, load transformer after text embeddings are cached
         if hasattr(self.sd, 'load_transformer_deferred'):
             self.sd.load_transformer_deferred()
-            # After deferred loading, apply unet configuration that was skipped earlier
-            self._configure_unet_after_deferred_load()
+            # After deferred loading, apply transformer configuration that was skipped earlier
+            self._configure_transformer_after_deferred_load()
 
         flush()
         self.last_save_step = self.step_num

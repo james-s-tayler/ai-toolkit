@@ -488,7 +488,8 @@ class LTX2Model(BaseModel):
             if os.path.exists(model_path) and model_path.endswith(".safetensors"):
                 combined_state_dict = load_file(model_path)
                 combined_state_dict = dequantize_state_dict(combined_state_dict)
-                # Update base_model_path if needed
+            else:
+                # Check if model_path is a full checkpoint directory
                 te_folder_path = os.path.join(model_path, "text_encoder")
                 if os.path.exists(te_folder_path):
                     base_model_path = model_path
@@ -532,7 +533,7 @@ class LTX2Model(BaseModel):
                 sample_rate=pipe.audio_sampling_rate,
                 mel_bins=audio_vae.config.mel_bins,
                 mel_hop_length=pipe.audio_hop_length,
-                n_fft=1024,
+                n_fft=1024,  # todo get this from vae if we can, I couldn't find it.
             ).to(self.device_torch, dtype=torch.float32)
             
             self.print_and_status_update("Text encoder loaded - ready for embedding cache")
