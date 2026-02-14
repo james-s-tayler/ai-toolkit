@@ -45,36 +45,39 @@ def unload_text_encoder(model: "BaseModel"):
 
             # the pipeline stores text encoders like text_encoder, text_encoder_2, text_encoder_3, etc.
             if hasattr(pipe, "text_encoder"):
-                # Store reference to old encoder to delete after replacement
+                # Store reference to old encoder before replacing
                 old_te = pipe.text_encoder
                 te = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
                 text_encoder_list.append(te)
-                # Move to CPU before deleting to free GPU memory first
-                old_te.to('cpu')
+                # Replace with fake encoder first to remove pipeline reference
                 pipe.text_encoder = te
+                # Now move old encoder to CPU to free GPU memory
+                old_te.to('cpu')
                 # Explicitly delete the old text encoder to free system RAM
                 del old_te
 
             i = 2
             while hasattr(pipe, f"text_encoder_{i}"):
-                # Store reference to old encoder to delete after replacement
+                # Store reference to old encoder before replacing
                 old_te = getattr(pipe, f"text_encoder_{i}")
                 te = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
                 text_encoder_list.append(te)
-                # Move to CPU before deleting to free GPU memory first
-                old_te.to('cpu')
+                # Replace with fake encoder first to remove pipeline reference
                 setattr(pipe, f"text_encoder_{i}", te)
+                # Now move old encoder to CPU to free GPU memory
+                old_te.to('cpu')
                 # Explicitly delete the old text encoder to free system RAM
                 del old_te
                 i += 1
             model.text_encoder = text_encoder_list
         else:
             # only has a single text encoder
-            # Store reference to old encoder to delete after replacement
+            # Store reference to old encoder before replacing
             old_te = model.text_encoder
-            # Move to CPU before deleting to free GPU memory first
-            old_te.to('cpu')
+            # Replace with fake encoder first to remove model reference
             model.text_encoder = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
+            # Now move old encoder to CPU to free GPU memory
+            old_te.to('cpu')
             # Explicitly delete the old text encoder to free system RAM
             del old_te
 
