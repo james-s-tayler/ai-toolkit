@@ -40,25 +40,42 @@ def unload_text_encoder(model: "BaseModel"):
 
     if model.text_encoder is not None:
         if isinstance(model.text_encoder, list):
+            old_text_encoder_list = model.text_encoder
             text_encoder_list = []
             pipe = model.pipeline
 
-            # the pipeline stores text encoders like text_encoder, text_encoder_2, text_encoder_3, etc.
-            if hasattr(pipe, "text_encoder"):
-                te = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
-                text_encoder_list.append(te)
-                pipe.text_encoder.to('cpu')
-                pipe.text_encoder = te
-
-            i = 2
-            while hasattr(pipe, f"text_encoder_{i}"):
-                te = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
-                text_encoder_list.append(te)
-                setattr(pipe, f"text_encoder_{i}", te)
-                i += 1
+            # Build new list and update pipeline
+            for i, te in enumerate(old_text_encoder_list):
+                # Create fake encoder
+                te_fake = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
+                text_encoder_list.append(te_fake)
+                
+                # Determine pipeline attribute name
+                # text_encoder (i=0), text_encoder_2 (i=1), text_encoder_3 (i=2), etc.
+                te_attr = "text_encoder" if i == 0 else f"text_encoder_{i+1}"
+                if hasattr(pipe, te_attr):
+                    setattr(pipe, te_attr, te_fake)
+            
+            # Replace list atomically
             model.text_encoder = text_encoder_list
+            
+            # Now cleanup old encoders
+            for te in old_text_encoder_list:
+                te.to('cpu')
+                del te
+                
         else:
-            # only has a single text encoder
-            model.text_encoder = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
+            # Single text encoder
+            old_te = model.text_encoder
+            te_fake = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
+            
+            # Replace in model and pipeline
+            model.text_encoder = te_fake
+            if hasattr(model, 'pipeline') and hasattr(model.pipeline, 'text_encoder'):
+                model.pipeline.text_encoder = te_fake
+            
+            # Cleanup old encoder
+            old_te.to('cpu')
+            del old_te
 
     flush()
