@@ -52,6 +52,7 @@ def unload_text_encoder(model: "BaseModel"):
                 # Determine pipeline attribute name
                 # text_encoder (i=0), text_encoder_2 (i=1), text_encoder_3 (i=2), etc.
                 te_attr = "text_encoder" if i == 0 else f"text_encoder_{i+1}"
+                # Update pipeline if it exists and has the attribute (defensive to handle edge cases)
                 if hasattr(model, 'pipeline') and model.pipeline is not None and hasattr(model.pipeline, te_attr):
                     setattr(model.pipeline, te_attr, te_fake)
             
@@ -72,6 +73,7 @@ def unload_text_encoder(model: "BaseModel"):
             
             # Replace in model and pipeline
             model.text_encoder = te_fake
+            # Update pipeline if it exists and has the attribute (defensive to handle edge cases)
             if hasattr(model, 'pipeline') and model.pipeline is not None and hasattr(model.pipeline, 'text_encoder'):
                 model.pipeline.text_encoder = te_fake
             
