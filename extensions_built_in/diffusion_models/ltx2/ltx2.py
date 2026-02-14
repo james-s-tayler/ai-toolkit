@@ -606,7 +606,7 @@ class LTX2Model(BaseModel):
                 sample_rate=pipe.audio_sampling_rate,
                 mel_bins=audio_vae.config.mel_bins,
                 mel_hop_length=pipe.audio_hop_length,
-                n_fft=1024,  # todo get this from vae if we can, I couldnt find it.
+                n_fft=1024,  # todo get this from vae if we can, I couldn't find it.
             ).to(self.device_torch, dtype=torch.float32)
 
             self.print_and_status_update("Model Loaded")
