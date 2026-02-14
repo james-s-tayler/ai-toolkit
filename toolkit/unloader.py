@@ -45,20 +45,37 @@ def unload_text_encoder(model: "BaseModel"):
 
             # the pipeline stores text encoders like text_encoder, text_encoder_2, text_encoder_3, etc.
             if hasattr(pipe, "text_encoder"):
+                # Store reference to old encoder to delete after replacement
+                old_te = pipe.text_encoder
                 te = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
                 text_encoder_list.append(te)
-                pipe.text_encoder.to('cpu')
+                # Move to CPU before deleting to free GPU memory first
+                old_te.to('cpu')
                 pipe.text_encoder = te
+                # Explicitly delete the old text encoder to free system RAM
+                del old_te
 
             i = 2
             while hasattr(pipe, f"text_encoder_{i}"):
+                # Store reference to old encoder to delete after replacement
+                old_te = getattr(pipe, f"text_encoder_{i}")
                 te = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
                 text_encoder_list.append(te)
+                # Move to CPU before deleting to free GPU memory first
+                old_te.to('cpu')
                 setattr(pipe, f"text_encoder_{i}", te)
+                # Explicitly delete the old text encoder to free system RAM
+                del old_te
                 i += 1
             model.text_encoder = text_encoder_list
         else:
             # only has a single text encoder
+            # Store reference to old encoder to delete after replacement
+            old_te = model.text_encoder
+            # Move to CPU before deleting to free GPU memory first
+            old_te.to('cpu')
             model.text_encoder = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
+            # Explicitly delete the old text encoder to free system RAM
+            del old_te
 
     flush()
