@@ -509,7 +509,7 @@ class LTX2Model(BaseModel):
             # Step 3: Load VAEs and components (lightweight)
             vae, audio_vae, connectors, vocoder = self._load_vaes_and_components(combined_state_dict, base_model_path, dtype)
             
-            # Step 3: Create pipeline with text encoder but WITHOUT transformer yet
+            # Step 4: Create pipeline with text encoder but WITHOUT transformer yet
             # This allows text embeddings to be cached before transformer is loaded
             self.noise_scheduler = LTX2Model.get_train_scheduler()
             
