@@ -62,7 +62,9 @@ def unload_text_encoder(model: "BaseModel"):
             # Now cleanup old encoders
             for te in old_text_encoder_list:
                 te.to('cpu')
-                del te
+            
+            # Delete the old list to free references
+            del old_text_encoder_list
                 
         else:
             # Single text encoder
@@ -76,6 +78,5 @@ def unload_text_encoder(model: "BaseModel"):
             
             # Cleanup old encoder
             old_te.to('cpu')
-            del old_te
 
     flush()
