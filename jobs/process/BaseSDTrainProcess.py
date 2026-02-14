@@ -841,6 +841,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         text_encoder = self.sd.text_encoder
         unet = self.sd.unet
         
+        # In sequential loading mode, text encoder has been unloaded (replaced with FakeTextEncoder)
+        # We cannot train it, so force train_text_encoder to False
+        train_text_encoder = False
+        
         # Network creation logic (moved from run())
         network_kwargs = self.network_config.network_kwargs
         is_lycoris = False
@@ -865,7 +869,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             multiplier=1.0,
             alpha=self.network_config.linear_alpha,
             train_unet=self.train_config.train_unet,
-            train_text_encoder=self.train_config.train_text_encoder,
+            train_text_encoder=train_text_encoder,  # False in sequential loading
             conv_lora_dim=self.network_config.conv,
             conv_alpha=self.network_config.conv_alpha,
             is_sdxl=self.model_config.is_xl or self.model_config.is_ssd,
@@ -897,7 +901,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.network.apply_to(
             text_encoder,
             unet,
-            self.train_config.train_text_encoder,
+            train_text_encoder,  # False in sequential loading
             self.train_config.train_unet
         )
 
