@@ -1252,23 +1252,25 @@ class BaseModel:
                 for name, param in self.text_encoder.named_parameters(recurse=True, prefix=f"{SD_PREFIX_TEXT_ENCODER}"):
                     named_params[name] = param
         if unet:
-            if self.is_flux or self.is_lumina2 or self.is_transformer:
-                for name, param in self.unet.named_parameters(recurse=True, prefix="transformer"):
-                    named_params[name] = param
-            else:
-                for name, param in self.unet.named_parameters(recurse=True, prefix=f"{SD_PREFIX_UNET}"):
-                    named_params[name] = param
+            # Skip if unet/transformer not loaded yet (sequential loading mode)
+            if self.unet is not None:
+                if self.is_flux or self.is_lumina2 or self.is_transformer:
+                    for name, param in self.unet.named_parameters(recurse=True, prefix="transformer"):
+                        named_params[name] = param
+                else:
+                    for name, param in self.unet.named_parameters(recurse=True, prefix=f"{SD_PREFIX_UNET}"):
+                        named_params[name] = param
 
-            if self.model_config.ignore_if_contains is not None:
-                # remove params that contain the ignore_if_contains from named params
-                for key in list(named_params.keys()):
-                    if any([s in f"transformer.{key}" for s in self.model_config.ignore_if_contains]):
-                        del named_params[key]
-            if self.model_config.only_if_contains is not None:
-                # remove params that do not contain the only_if_contains from named params
-                for key in list(named_params.keys()):
-                    if not any([s in f"transformer.{key}" for s in self.model_config.only_if_contains]):
-                        del named_params[key]
+                if self.model_config.ignore_if_contains is not None:
+                    # remove params that contain the ignore_if_contains from named params
+                    for key in list(named_params.keys()):
+                        if any([s in f"transformer.{key}" for s in self.model_config.ignore_if_contains]):
+                            del named_params[key]
+                if self.model_config.only_if_contains is not None:
+                    # remove params that do not contain the only_if_contains from named params
+                    for key in list(named_params.keys()):
+                        if not any([s in f"transformer.{key}" for s in self.model_config.only_if_contains]):
+                            del named_params[key]
 
         if refiner:
             for name, param in self.refiner_unet.named_parameters(recurse=True, prefix=f"{SD_PREFIX_REFINER_UNET}"):
@@ -1376,12 +1378,18 @@ class BaseModel:
                 'training': self.vae.training,
                 'device': self.vae.device,
             },
-            'unet': {
+        }
+        
+        # Only save unet state if it's loaded (not None in sequential loading)
+        if self.unet is not None:
+            self.device_state['unet'] = {
                 'training': self.unet.training,
                 'device': self.unet.device,
                 'requires_grad': unet_has_grad,
-            },
-        }
+            }
+        else:
+            # Use empty preset for unet if not loaded yet
+            self.device_state['unet'] = empty_preset['unet']
         if isinstance(self.text_encoder, list):
             self.device_state['text_encoder']: List[dict] = []
             for encoder in self.text_encoder:
