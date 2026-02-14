@@ -788,6 +788,44 @@ class BaseSDTrainProcess(BaseTrainProcess):
             should_unload_te = self.train_config.unload_text_encoder or self.is_caching_text_embeddings
             if should_unload_te:
                 self.sd._should_load_text_encoder_first = True
+    
+    def _configure_unet_after_deferred_load(self):
+        """
+        Applies unet configuration after deferred transformer loading.
+        This is called for LTX-2 sequential loading mode.
+        """
+        if self.sd.unet is None:
+            # No unet to configure
+            return
+        
+        dtype = get_torch_dtype(self.train_config.dtype)
+        unet = self.sd.unet
+        
+        # Apply configurations that were skipped during initial load
+        if self.model_config.compile:
+            try:
+                torch.compile(unet, dynamic=True, fullgraph=True, mode='max-autotune')
+            except Exception as e:
+                print_acc(f"Failed to compile model: {e}")
+                print_acc("Continuing without compilation")
+        
+        if self.train_config.xformers:
+            unet.enable_xformers_memory_efficient_attention()
+        
+        if self.train_config.attention_backend != 'native':
+            if hasattr(unet, 'set_attention_backend'):
+                unet.set_attention_backend(self.train_config.attention_backend)
+        
+        if self.train_config.gradient_checkpointing:
+            if hasattr(unet, 'enable_gradient_checkpointing'):
+                unet.enable_gradient_checkpointing()
+            elif hasattr(unet, 'gradient_checkpointing'):
+                unet.gradient_checkpointing = True
+        
+        unet.to(self.device_torch, dtype=dtype)
+        unet.requires_grad_(False)
+        unet.eval()
+
 
 
     def get_latest_save_path(self, name=None, post=''):
@@ -1598,7 +1636,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # compile the model if needed
         if self.model_config.compile:
             try:
-                torch.compile(self.sd.unet, dynamic=True, fullgraph=True, mode='max-autotune')
+                if self.sd.unet is not None:  # Skip if transformer not loaded yet
+                    torch.compile(self.sd.unet, dynamic=True, fullgraph=True, mode='max-autotune')
             except Exception as e:
                 print_acc(f"Failed to compile model: {e}")
                 print_acc("Continuing without compilation")
@@ -1616,7 +1655,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         if self.train_config.xformers:
             vae.enable_xformers_memory_efficient_attention()
-            unet.enable_xformers_memory_efficient_attention()
+            if unet is not None:  # Skip if transformer not loaded yet
+                unet.enable_xformers_memory_efficient_attention()
             if isinstance(text_encoder, list):
                 for te in text_encoder:
                     # if it has it
@@ -1626,7 +1666,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.train_config.attention_backend != 'native':
             if hasattr(vae, 'set_attention_backend'):
                 vae.set_attention_backend(self.train_config.attention_backend)
-            if hasattr(unet, 'set_attention_backend'):
+            if unet is not None and hasattr(unet, 'set_attention_backend'):  # Skip if transformer not loaded yet
                 unet.set_attention_backend(self.train_config.attention_backend)
             if isinstance(text_encoder, list):
                 for te in text_encoder:
@@ -1660,12 +1700,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         if self.train_config.gradient_checkpointing:
             # if has method enable_gradient_checkpointing
-            if hasattr(unet, 'enable_gradient_checkpointing'):
-                unet.enable_gradient_checkpointing()
-            elif hasattr(unet, 'gradient_checkpointing'):
-                unet.gradient_checkpointing = True
-            else:
-                print("Gradient checkpointing not supported on this model")
+            if unet is not None:  # Skip if transformer not loaded yet
+                if hasattr(unet, 'enable_gradient_checkpointing'):
+                    unet.enable_gradient_checkpointing()
+                elif hasattr(unet, 'gradient_checkpointing'):
+                    unet.gradient_checkpointing = True
+                else:
+                    print("Gradient checkpointing not supported on this model")
             if isinstance(text_encoder, list):
                 for te in text_encoder:
                     if hasattr(te, 'enable_gradient_checkpointing'):
@@ -1694,9 +1735,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         else:
             text_encoder.requires_grad_(False)
             text_encoder.eval()
-        unet.to(self.device_torch, dtype=dtype)
-        unet.requires_grad_(False)
-        unet.eval()
+        if unet is not None:  # Skip if transformer not loaded yet
+            unet.to(self.device_torch, dtype=dtype)
+            unet.requires_grad_(False)
+            unet.eval()
         vae = vae.to(torch.device('cpu'), dtype=dtype)
         vae.requires_grad_(False)
         vae.eval()
@@ -2031,6 +2073,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # For LTX-2 with sequential loading, load transformer after text embeddings are cached
         if hasattr(self.sd, 'load_transformer_deferred'):
             self.sd.load_transformer_deferred()
+            # After deferred loading, apply unet configuration that was skipped earlier
+            self._configure_unet_after_deferred_load()
 
         flush()
         self.last_save_step = self.step_num
