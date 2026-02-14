@@ -1,3 +1,4 @@
+import gc
 import torch
 from toolkit.basic import flush
 from typing import TYPE_CHECKING
@@ -41,12 +42,24 @@ def unload_text_encoder(model: "BaseModel"):
     if model.text_encoder is not None:
         if isinstance(model.text_encoder, list):
             # For models with text encoder as a list
-            # First, unload all encoders in the list
+            # Store references to all encoders before clearing the list
+            encoders_to_unload = []
             for encoder in model.text_encoder:
-                # Move to CPU and delete if it's not already a FakeTextEncoder
+                # Keep track of real encoders (not fakes) that need unloading
                 if not isinstance(encoder, FakeTextEncoder):
-                    encoder = encoder.to('cpu')
-                    del encoder
+                    encoders_to_unload.append(encoder)
+            
+            # Clear the list first to remove all references
+            model.text_encoder.clear()
+            
+            # Now unload the stored encoders
+            for encoder in encoders_to_unload:
+                encoder = encoder.to('cpu')
+                del encoder
+            
+            # Clear the temporary list
+            encoders_to_unload.clear()
+            del encoders_to_unload
             
             text_encoder_list = []
             pipe = model.pipeline
@@ -96,8 +109,8 @@ def unload_text_encoder(model: "BaseModel"):
 
     # Aggressively free memory
     flush()
-    # Run garbage collection multiple times to ensure all references are cleared
-    import gc
-    gc.collect()
-    gc.collect()
+    # Force full garbage collection including all generations
+    # Multiple passes help clean up circular references in large model graphs
+    gc.collect(2)  # Collect generation 2 (oldest objects)
+    gc.collect(2)  # Second pass to catch any newly unreachable objects
     torch.cuda.empty_cache()
