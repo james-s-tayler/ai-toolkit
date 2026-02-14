@@ -228,6 +228,26 @@ class LTX2Model(BaseModel):
 
     def get_bucket_divisibility(self):
         return 32
+    
+    def _load_combined_state_dict_if_needed(self, model_path):
+        """
+        Helper method to check if model_path is a safetensors file and load the combined state dict.
+        Also updates base_model_path if the directory contains a full checkpoint.
+        Returns (combined_state_dict, base_model_path).
+        """
+        combined_state_dict = None
+        base_model_path = self.model_config.extras_name_or_path
+        
+        if os.path.exists(model_path) and model_path.endswith(".safetensors"):
+            combined_state_dict = load_file(model_path)
+            combined_state_dict = dequantize_state_dict(combined_state_dict)
+        else:
+            # Check if model_path is a full checkpoint directory
+            te_folder_path = os.path.join(model_path, "text_encoder")
+            if os.path.exists(te_folder_path):
+                base_model_path = model_path
+        
+        return combined_state_dict, base_model_path
 
     def _load_text_encoder_and_tokenizer(self, base_model_path, dtype):
         """
@@ -361,10 +381,9 @@ class LTX2Model(BaseModel):
         self.print_and_status_update("Loading transformer")
         base_model_path = self.model_config.extras_name_or_path
         
-        # if we have a safetensors file it is a mono checkpoint
-        if combined_state_dict is None and os.path.exists(model_path) and model_path.endswith(".safetensors"):
-            combined_state_dict = load_file(model_path)
-            combined_state_dict = dequantize_state_dict(combined_state_dict)
+        # Load combined state dict if needed (safetensors file)
+        if combined_state_dict is None:
+            combined_state_dict, base_model_path = self._load_combined_state_dict_if_needed(model_path)
 
         if combined_state_dict is not None:
             original_dit_ckpt = get_model_state_dict_from_combined_ckpt(
@@ -375,7 +394,8 @@ class LTX2Model(BaseModel):
         else:
             transformer_path = model_path
             transformer_subfolder = "transformer"
-            if os.path.exists(transformer_path):
+            # Only treat model_path as a directory if it's not a safetensors file
+            if os.path.exists(transformer_path) and os.path.isdir(transformer_path):
                 transformer_subfolder = None
                 transformer_path = os.path.join(transformer_path, "transformer")
                 # check if the path is a full checkpoint.
@@ -484,16 +504,7 @@ class LTX2Model(BaseModel):
             text_encoder, tokenizer = self._load_text_encoder_and_tokenizer(base_model_path, dtype)
             
             # Step 2: Load VAEs and components (lightweight)
-            # Note: We need to check for combined_state_dict first
-            if os.path.exists(model_path) and model_path.endswith(".safetensors"):
-                combined_state_dict = load_file(model_path)
-                combined_state_dict = dequantize_state_dict(combined_state_dict)
-            else:
-                # Check if model_path is a full checkpoint directory
-                te_folder_path = os.path.join(model_path, "text_encoder")
-                if os.path.exists(te_folder_path):
-                    base_model_path = model_path
-            
+            combined_state_dict, base_model_path = self._load_combined_state_dict_if_needed(model_path)
             vae, audio_vae, connectors, vocoder = self._load_vaes_and_components(combined_state_dict, base_model_path, dtype)
             
             # Step 3: Create pipeline with text encoder but WITHOUT transformer yet
