@@ -646,11 +646,15 @@ class LTX2Model(BaseModel):
         generator: torch.Generator,
         extra: dict,
     ):
+        verbose = self.model_config.verbose
+        print_verbose(verbose, f"generate_single_image() called: num_frames={gen_config.num_frames}, height={gen_config.height}, width={gen_config.width}")
         if self.model.device == torch.device("cpu"):
+            print_verbose(verbose, f"Moving transformer from CPU to {self.device_torch}")
             self.model.to(self.device_torch)
 
         # handle control image
         if gen_config.ctrl_img is not None:
+            print_verbose(verbose, f"Control image provided: {gen_config.ctrl_img}, switching to Image-to-Video pipeline")
             # switch to image to video pipeline
             pipeline = LTX2ImageToVideoPipeline(
                 scheduler=pipeline.scheduler,
@@ -662,8 +666,10 @@ class LTX2Model(BaseModel):
                 transformer=pipeline.transformer,
                 vocoder=pipeline.vocoder,
             )
+            print_verbose(verbose, f"Switched to LTX2ImageToVideoPipeline")
 
         is_video = gen_config.num_frames > 1
+        print_verbose(verbose, f"is_video={is_video}")
         # override the generate single image to handle video + audio generation
         if is_video:
             gen_config._orig_save_image_function = gen_config.save_image
@@ -671,18 +677,25 @@ class LTX2Model(BaseModel):
             gen_config.log_image = partial(blank_log_image_function, gen_config)
             # set output extension to mp4
             gen_config.output_ext = "mp4"
+            print_verbose(verbose, f"Video mode: overridden save functions, output_ext=mp4")
 
         # reactivate progress bar since this is slooooow
         pipeline.set_progress_bar_config(disable=False)
         pipeline = pipeline.to(self.device_torch)
+        print_verbose(verbose, f"Pipeline moved to {self.device_torch}, progress bar enabled")
 
         # make sure dimensions are valid
         bd = self.get_bucket_divisibility()
+        original_height = gen_config.height
+        original_width = gen_config.width
         gen_config.height = (gen_config.height // bd) * bd
         gen_config.width = (gen_config.width // bd) * bd
+        if original_height != gen_config.height or original_width != gen_config.width:
+            print_verbose(verbose, f"Adjusted dimensions for bucket divisibility ({bd}): {original_height}x{original_width} -> {gen_config.height}x{gen_config.width}")
 
         # handle control image
         if gen_config.ctrl_img is not None:
+            print_verbose(verbose, f"Loading and resizing control image: {gen_config.ctrl_img}")
             control_img = Image.open(gen_config.ctrl_img).convert("RGB")
             # resize the control image
             control_img = control_img.resize(
@@ -690,13 +703,17 @@ class LTX2Model(BaseModel):
             )
             # add the control image to the extra dict
             extra["image"] = control_img
+            print_verbose(verbose, f"Control image loaded and resized to {gen_config.width}x{gen_config.height}")
 
         # frames must be divisible by 8 then + 1. so 1, 9, 17, 25, etc.
+        original_num_frames = gen_config.num_frames
         if gen_config.num_frames != 1:
             if (gen_config.num_frames - 1) % 8 != 0:
                 gen_config.num_frames = ((gen_config.num_frames - 1) // 8) * 8 + 1
+                print_verbose(verbose, f"Adjusted num_frames for divisibility: {original_num_frames} -> {gen_config.num_frames}")
 
         if self.low_vram:
+            print_verbose(verbose, f"Low VRAM mode: enabling VAE tiling")
             # set vae to tile decode
             pipeline.vae.enable_tiling(
                 tile_sample_min_height=256,
@@ -706,11 +723,14 @@ class LTX2Model(BaseModel):
                 tile_sample_stride_width=224,
                 tile_sample_stride_num_frames=4,
             )
+            print_verbose(verbose, f"VAE tiling enabled")
         
         # We only encode and store the minimum prompt tokens, but need them padded to 1024 for LTX2
         conditional_embeds = self.pad_embeds(conditional_embeds)
         unconditional_embeds = self.pad_embeds(unconditional_embeds)
+        print_verbose(verbose, f"Embeddings padded to 1024 tokens")
 
+        print_verbose(verbose, f"Running pipeline inference: num_inference_steps={gen_config.num_inference_steps}, guidance_scale={gen_config.guidance_scale}")
         video, audio = pipeline(
             prompt_embeds=conditional_embeds.text_embeds.to(
                 self.device_torch, dtype=self.torch_dtype
@@ -735,14 +755,18 @@ class LTX2Model(BaseModel):
             output_type="np" if is_video else "pil",
             **extra,
         )
+        print_verbose(verbose, f"Pipeline inference completed")
         if self.low_vram:
             # Restore no tiling
             pipeline.vae.use_tiling = False
+            print_verbose(verbose, f"VAE tiling disabled")
 
         if is_video:
             # redurn as a dict, we will handle it with an override function
             video = (video * 255).round().astype("uint8")
             video = torch.from_numpy(video)
+            print_verbose(verbose, f"Video mode: converted output, video shape={video[0].shape}, audio shape={audio[0].shape}")
+            print_verbose(verbose, f"generate_single_image() completed, returning video dict")
             return {
                 "video": video[0],
                 "fps": gen_config.fps,
@@ -756,10 +780,14 @@ class LTX2Model(BaseModel):
             video = video[0]  # list of pil images
             audio = audio[0]  # tensor
             if gen_config.num_frames > 1:
+                print_verbose(verbose, f"Image mode: returning {len(video)} frames")
+                print_verbose(verbose, f"generate_single_image() completed")
                 return video  # return the frames.
             else:
                 # get just the first image
                 img = video[0]
+                print_verbose(verbose, f"Image mode: returning single image")
+                print_verbose(verbose, f"generate_single_image() completed")
             return img
 
     def encode_audio(self, audio_data_list):
