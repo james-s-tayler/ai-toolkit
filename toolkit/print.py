@@ -8,6 +8,13 @@ def print_acc(*args, **kwargs):
         print(*args, **kwargs)
 
 
+def print_verbose(verbose: bool, *args, **kwargs):
+    """Print message only if verbose flag is True and this is the main process."""
+    if verbose and get_accelerator().is_local_main_process:
+        # Add [VERBOSE] prefix to make verbose logs easily identifiable
+        print("[VERBOSE]", *args, **kwargs)
+
+
 class Logger:
     def __init__(self, filename):
         self.terminal = sys.stdout
