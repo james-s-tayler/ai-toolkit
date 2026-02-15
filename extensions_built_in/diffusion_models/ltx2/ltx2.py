@@ -762,7 +762,7 @@ class LTX2Model(BaseModel):
             print_verbose(verbose, f"VAE tiling disabled")
 
         if is_video:
-            # redurn as a dict, we will handle it with an override function
+            # return as a dict, we will handle it with an override function
             video = (video * 255).round().astype("uint8")
             video = torch.from_numpy(video)
             print_verbose(verbose, f"Video mode: converted output, video shape={video[0].shape}, audio shape={audio[0].shape}")
