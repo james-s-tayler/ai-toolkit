@@ -1587,7 +1587,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 },
                 arch=arch,
             )
-            print_verbose(verbose, f"Scheduler created")
+            print_verbose(verbose, f"Scheduler created: {type(sampler).__name__} with arch={arch}")
 
         if self.train_config.train_refiner and self.model_config.refiner_name_or_path is not None and self.network_config is None:
             print_verbose(verbose, f"Training refiner: checking for previous refiner save")
@@ -1630,6 +1630,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print_acc(f"Failed to compile model: {e}")
                 print_acc("Continuing without compilation")
                 print_verbose(verbose, f"Model compilation failed: {e}")
+        else:
+            print_verbose(verbose, f"Torch compile not enabled, skipping compilation")
 
         self.sd.add_after_sample_image_hook(self.sample_step_hook)
         print_verbose(verbose, f"Added sample step hook")
@@ -1656,6 +1658,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     if hasattr(te, 'enable_xformers_memory_efficient_attention'):
                         te.enable_xformers_memory_efficient_attention()
             print_verbose(verbose, f"Xformers enabled successfully")
+        else:
+            print_verbose(verbose, f"Xformers not enabled, using default attention implementation")
         
         if self.train_config.attention_backend != 'native':
             print_verbose(verbose, f"Setting attention backend to: {self.train_config.attention_backend}")
