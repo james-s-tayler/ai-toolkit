@@ -1,6 +1,7 @@
 import torch
 from .manager_modules import LinearLayerMemoryManager, ConvLayerMemoryManager
 import random
+from toolkit.print import print_verbose
 
 LINEAR_MODULES = [
     "Linear",
@@ -71,24 +72,33 @@ class MemoryManager:
         module: torch.nn.Module, 
         device: torch.device, 
         offload_percent: float = 1.0,
-        ignore_modules: list[torch.nn.Module] = []
+        ignore_modules: list[torch.nn.Module] = [],
+        verbose: bool = False
     ):
+        print_verbose(verbose, f"MemoryManager.attach() called for module {module.__class__.__name__}, device={device}, offload_percent={offload_percent}")
         if hasattr(module, "_memory_manager"):
             # already attached
+            print_verbose(verbose, f"MemoryManager already attached to {module.__class__.__name__}, skipping")
             return
 
         module._memory_manager = cls(module, device)
+        print_verbose(verbose, f"MemoryManager instance created for {module.__class__.__name__}")
 
         # override the to method to handle memory management
         module._mm_to = module.to
         module.to = module._memory_manager.memory_managed_to
+        print_verbose(verbose, f"Overridden .to() method for {module.__class__.__name__}")
 
         # add ignore modules to unmanaged list
         for im in ignore_modules:
             module._memory_manager.unmanaged_modules.append(im)
+        print_verbose(verbose, f"Added {len(ignore_modules)} modules to ignore list")
             
         # count ignore modules as processed
         modules_processed = [x for x in ignore_modules]
+        linear_count = 0
+        conv_count = 0
+        unmanaged_count = 0
         # attach to all modules
         for name, sub_module in module.named_modules():
             for child_name, child_module in sub_module.named_modules():
@@ -103,11 +113,13 @@ class MemoryManager:
                             skip = True
                     if skip:
                         module._memory_manager.unmanaged_modules.append(child_module)
+                        unmanaged_count += 1
                     else:
                         # linear
                         LinearLayerMemoryManager.attach(
                             child_module, module._memory_manager
                         )
+                        linear_count += 1
                         # attach to ARA as well
                         if hasattr(child_module, "ara_lora_ref"):
                             ara = child_module.ara_lora_ref()
@@ -115,6 +127,7 @@ class MemoryManager:
                                 MemoryManager.attach(
                                     ara, 
                                     device,
+                                    verbose=verbose
                                 )
                     modules_processed.append(child_module)
                 elif (
@@ -128,11 +141,13 @@ class MemoryManager:
                             skip = True
                     if skip:
                         module._memory_manager.unmanaged_modules.append(child_module)
+                        unmanaged_count += 1
                     else:
                         # conv
                         ConvLayerMemoryManager.attach(
                             child_module, module._memory_manager
                         )
+                        conv_count += 1
                         # attach to ARA as well
                         if hasattr(child_module, "ara_lora_ref"):
                             ara = child_module.ara_lora_ref()
@@ -140,6 +155,7 @@ class MemoryManager:
                                 MemoryManager.attach(
                                     ara, 
                                     device,
+                                    verbose=verbose
                                 )
                             modules_processed.append(ara)
                     modules_processed.append(child_module)
@@ -149,5 +165,7 @@ class MemoryManager:
                 ):
                     # unmanaged
                     module._memory_manager.unmanaged_modules.append(child_module)
+                    unmanaged_count += 1
                 else:
                     continue
+        print_verbose(verbose, f"MemoryManager.attach() completed for {module.__class__.__name__}: {linear_count} linear layers, {conv_count} conv layers, {unmanaged_count} unmanaged modules")

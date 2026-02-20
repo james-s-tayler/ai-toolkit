@@ -21,6 +21,7 @@ from toolkit.image_utils import show_tensors, show_latents
 from toolkit.ip_adapter import IPAdapter
 from toolkit.custom_adapter import CustomAdapter
 from toolkit.print import print_acc
+from toolkit.print import print_verbose
 from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
@@ -1186,11 +1187,14 @@ class SDTrainer(BaseSDTrainProcess):
         is_primary_pred: bool = False,
         **kwargs,
     ):
+        verbose = self.model_config.verbose if hasattr(self.model_config, 'verbose') else False
+        if is_primary_pred:
+            print_verbose(verbose, f"predict_noise() called (primary prediction): latents shape={noisy_latents.shape}, timesteps={timesteps}")
         dtype = get_torch_dtype(self.train_config.dtype)
         guidance_embedding_scale = self.train_config.cfg_scale
         if self.train_config.do_guidance_loss:
             guidance_embedding_scale = self._guidance_loss_target_batch
-        return self.sd.predict_noise(
+        result = self.sd.predict_noise(
             latents=noisy_latents.to(self.device_torch, dtype=dtype),
             conditional_embeddings=conditional_embeds.to(self.device_torch, dtype=dtype),
             unconditional_embeddings=unconditional_embeds,
@@ -1203,6 +1207,9 @@ class SDTrainer(BaseSDTrainProcess):
             batch=batch,
             **kwargs
         )
+        if is_primary_pred:
+            print_verbose(verbose, f"predict_noise() completed, result shape={result.shape}")
+        return result
     
 
     def train_single_accumulation(self, batch: DataLoaderBatchDTO):
@@ -2038,13 +2045,18 @@ class SDTrainer(BaseSDTrainProcess):
         # flush()
 
     def hook_train_loop(self, batch: Union[DataLoaderBatchDTO, List[DataLoaderBatchDTO]]):
+        verbose = self.model_config.verbose if hasattr(self.model_config, 'verbose') else False
+        print_verbose(verbose, f"hook_train_loop() called at step {self.step_num}")
         if isinstance(batch, list):
             batch_list = batch
         else:
             batch_list = [batch]
+        print_verbose(verbose, f"Processing {len(batch_list)} batches for gradient accumulation")
         total_loss = None
         self.optimizer.zero_grad()
-        for batch in batch_list:
+        print_verbose(verbose, f"Optimizer gradients zeroed")
+        for idx, batch in enumerate(batch_list):
+            print_verbose(verbose, f"Training batch {idx+1}/{len(batch_list)}")
             if self.sd.is_multistage:
                 # handle multistage switching
                 if self.steps_this_boundary >= self.train_config.switch_boundary_every or self.current_boundary_index not in self.sd.trainable_multistage_boundaries:
@@ -2056,8 +2068,10 @@ class SDTrainer(BaseSDTrainProcess):
                             self.current_boundary_index = 0
                         if self.current_boundary_index in self.sd.trainable_multistage_boundaries:
                             # if this boundary is trainable, we can stop looking
+                            print_verbose(verbose, f"Switched to multistage boundary {self.current_boundary_index}")
                             break
             loss = self.train_single_accumulation(batch)
+            print_verbose(verbose, f"Batch {idx+1} loss: {loss.item():.4f}")
             self.steps_this_boundary += 1
             if total_loss is None:
                 total_loss = loss
@@ -2065,9 +2079,11 @@ class SDTrainer(BaseSDTrainProcess):
                 total_loss += loss
             if len(batch_list) > 1 and self.model_config.low_vram:
                 torch.cuda.empty_cache()
+                print_verbose(verbose, f"Cleared CUDA cache (low_vram mode)")
 
 
         if not self.is_grad_accumulation_step:
+            print_verbose(verbose, f"Performing optimizer step (not accumulating)")
             # fix this for multi params
             if self.train_config.optimizer != 'adafactor':
                 if isinstance(self.params[0], dict):
@@ -2075,9 +2091,11 @@ class SDTrainer(BaseSDTrainProcess):
                         self.accelerator.clip_grad_norm_(self.params[i]['params'], self.train_config.max_grad_norm)
                 else:
                     self.accelerator.clip_grad_norm_(self.params, self.train_config.max_grad_norm)
+                print_verbose(verbose, f"Gradients clipped to max_norm={self.train_config.max_grad_norm}")
             # only step if we are not accumulating
             with self.timer('optimizer_step'):
                 self.optimizer.step()
+                print_verbose(verbose, f"Optimizer stepped")
 
                 self.optimizer.zero_grad(set_to_none=True)
                 if self.adapter and isinstance(self.adapter, CustomAdapter):
@@ -2085,13 +2103,16 @@ class SDTrainer(BaseSDTrainProcess):
             if self.ema is not None:
                 with self.timer('ema_update'):
                     self.ema.update()
+                print_verbose(verbose, f"EMA updated")
         else:
             # gradient accumulation. Just a place for breakpoint
+            print_verbose(verbose, f"Gradient accumulation step, not performing optimizer step yet")
             pass
 
         # TODO Should we only step scheduler on grad step? If so, need to recalculate last step
         with self.timer('scheduler_step'):
             self.lr_scheduler.step()
+        print_verbose(verbose, f"Learning rate scheduler stepped")
 
         if self.embedding is not None:
             with self.timer('restore_embeddings'):
@@ -2105,6 +2126,7 @@ class SDTrainer(BaseSDTrainProcess):
         loss_dict = OrderedDict(
             {'loss': (total_loss / len(batch_list)).item()}
         )
+        print_verbose(verbose, f"hook_train_loop() completed with average loss: {loss_dict['loss']:.4f}")
 
         self.end_of_training_loop()
 
