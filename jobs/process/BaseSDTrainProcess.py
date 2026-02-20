@@ -64,7 +64,7 @@ from toolkit.config_modules import SaveConfig, LoggingConfig, SampleConfig, Netw
 from toolkit.logging_aitk import create_logger
 from diffusers import FluxTransformer2DModel
 from toolkit.accelerator import get_accelerator, unwrap_model
-from toolkit.print import print_acc
+from toolkit.print import print_acc, print_verbose
 from accelerate import Accelerator
 import transformers
 import diffusers
@@ -1304,28 +1304,33 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     # if we have a 5d tensor, then we need to do it on a per batch item, per channel basis, per frame
                     s = (noise.shape[0], noise.shape[1], noise.shape[2], 1, 1)
                 
-                if self.train_config.random_noise_multiplier > 0.0:
-                    
-                    # do it on a per batch item, per channel basis
-                    noise_multiplier = 1 + torch.randn(
-                        s,
-                        device=noise.device,
-                        dtype=noise.dtype
-                    ) * self.train_config.random_noise_multiplier
-                
-            with self.timer('make_noisy_latents'):
-
                 noise = noise * noise_multiplier
+                
+                if self.train_config.do_signal_correction_noise:
+                    batch_noise = latents.clone().to(noise.device, dtype=noise.dtype)
+                    scn_scale = torch.randn(
+                        batch_noise.shape[0], batch_noise.shape[1], 1, 1,
+                        device=batch_noise.device, 
+                        dtype=batch_noise.dtype
+                    ) * self.train_config.signal_correction_noise_scale
+                    batch_noise = batch_noise * scn_scale
+                    noise = noise + batch_noise 
                 
                 if self.train_config.random_noise_shift > 0.0:
                     # get random noise -1 to 1
                     noise_shift = torch.randn(
-                        s,  
+                        batch_size, latents.shape[1], 1, 1,
                         device=noise.device,
                         dtype=noise.dtype
                     ) * self.train_config.random_noise_shift
                     # add to noise
                     noise += noise_shift
+                
+                if self.train_config.random_noise_multiplier > 0.0:
+                    sigma = self.train_config.random_noise_multiplier
+                    noise_multiplier = torch.exp(torch.randn(s, device=noise.device, dtype=noise.dtype) * sigma)
+                
+            with self.timer('make_noisy_latents'):
 
                 latent_multiplier = self.train_config.latent_multiplier
 
@@ -1336,6 +1341,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     latent_multiplier = normalizer
 
                 latents = latents * latent_multiplier
+                
+                if self.train_config.do_blank_stabilization:
+                    # zero out latents with blank prompts
+                    blank_latent = torch.zeros_like(latents)
+                    for i, prompt in enumerate(conditioned_prompts):
+                        if prompt.strip() == '':
+                            latents[i] = blank_latent[i]
+                
                 batch.latents = latents
 
                 # normalize latents to a mean of 0 and an std of 1
@@ -1516,29 +1529,47 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.sd.adapter = self.adapter
 
     def run(self):
+        # Get verbose flag from model config
+        verbose = self.model_config.verbose if hasattr(self.model_config, 'verbose') else False
+        print_verbose(verbose, f"========== BaseSDTrainProcess.run() starting ==========")
+        print_verbose(verbose, f"Training configuration: steps={self.train_config.steps}, batch_size={self.train_config.batch_size}, dtype={self.train_config.dtype}")
+        print_verbose(verbose, f"Model config: name_or_path={self.model_config.name_or_path}, is_fine_tuning={self.is_fine_tuning}")
+        
         # torch.autograd.set_detect_anomaly(True)
         # run base process run
         BaseTrainProcess.run(self)
         params = []
 
         ### HOOK ###
+        print_verbose(verbose, f"Executing hook_before_model_load()")
         self.hook_before_model_load()
         model_config_to_load = copy.deepcopy(self.model_config)
+        print_verbose(verbose, f"Model config copied for loading")
 
         if self.is_fine_tuning:
+            print_verbose(verbose, f"Fine-tuning mode: checking for latest checkpoint to resume from")
             # get the latest checkpoint
             # check to see if we have a latest save
             latest_save_path = self.get_latest_save_path()
 
             if latest_save_path is not None:
                 print_acc(f"#### IMPORTANT RESUMING FROM {latest_save_path} ####")
+                print_verbose(verbose, f"Resuming from checkpoint: {latest_save_path}")
                 model_config_to_load.name_or_path = latest_save_path
+                print_verbose(verbose, f"Updated model_config.name_or_path to: {latest_save_path}")
                 self.load_training_state_from_metadata(latest_save_path)
+                print_verbose(verbose, f"Loaded training state from metadata")
+            else:
+                print_verbose(verbose, f"No previous checkpoint found, starting fresh")
 
         ModelClass = get_model_class(self.model_config)
+        print_verbose(verbose, f"Model class: {ModelClass.__name__}")
+        
         # if the model class has get_train_scheduler static method
         if hasattr(ModelClass, 'get_train_scheduler'):
+            print_verbose(verbose, f"Model class has get_train_scheduler, using model-specific scheduler")
             sampler = ModelClass.get_train_scheduler()
+            print_verbose(verbose, f"Scheduler obtained from model class")
         else:
             # get the noise scheduler
             arch = 'sd'
@@ -1548,6 +1579,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 arch = 'flux'
             if self.model_config.is_lumina2:
                 arch = 'lumina2'
+            print_verbose(verbose, f"Using standard scheduler: arch={arch}, scheduler={self.train_config.noise_scheduler}, prediction_type={'v_prediction' if self.model_config.is_v_pred else 'epsilon'}")
             sampler = get_sampler(
                 self.train_config.noise_scheduler,
                 {
@@ -1555,13 +1587,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 },
                 arch=arch,
             )
+            print_verbose(verbose, f"Scheduler created: {type(sampler).__name__} with arch={arch}")
 
         if self.train_config.train_refiner and self.model_config.refiner_name_or_path is not None and self.network_config is None:
+            print_verbose(verbose, f"Training refiner: checking for previous refiner save")
             previous_refiner_save = self.get_latest_save_path(self.job.name + '_refiner')
             if previous_refiner_save is not None:
+                print_verbose(verbose, f"Found previous refiner save: {previous_refiner_save}")
                 model_config_to_load.refiner_name_or_path = previous_refiner_save
                 self.load_training_state_from_metadata(previous_refiner_save)
+                print_verbose(verbose, f"Loaded refiner training state")
+            else:
+                print_verbose(verbose, f"No previous refiner save found")
 
+        print_verbose(verbose, f"Creating model instance: device={self.accelerator.device}, dtype={self.train_config.dtype}")
         self.sd = ModelClass(
             # todo handle single gpu and multi gpu here
             # device=self.device,
@@ -1571,22 +1610,34 @@ class BaseSDTrainProcess(BaseTrainProcess):
             custom_pipeline=self.custom_pipeline,
             noise_scheduler=sampler,
         )
+        print_verbose(verbose, f"Model instance created: {type(self.sd).__name__}")
         
+        print_verbose(verbose, f"Executing hook_after_sd_init_before_load()")
         self.hook_after_sd_init_before_load()
+        
         # run base sd process run
+        print_verbose(verbose, f"Loading model from path: {model_config_to_load.name_or_path}")
         self.sd.load_model()
+        print_verbose(verbose, f"Model loaded successfully")
         
         # compile the model if needed
         if self.model_config.compile:
+            print_verbose(verbose, f"Attempting to compile model with torch.compile")
             try:
                 torch.compile(self.sd.unet, dynamic=True, fullgraph=True, mode='max-autotune')
+                print_verbose(verbose, f"Model compilation successful")
             except Exception as e:
                 print_acc(f"Failed to compile model: {e}")
                 print_acc("Continuing without compilation")
+                print_verbose(verbose, f"Model compilation failed: {e}")
+        else:
+            print_verbose(verbose, f"Torch compile not enabled, skipping compilation")
 
         self.sd.add_after_sample_image_hook(self.sample_step_hook)
+        print_verbose(verbose, f"Added sample step hook")
 
         dtype = get_torch_dtype(self.train_config.dtype)
+        print_verbose(verbose, f"Training dtype resolved: {dtype}")
 
         # model is loaded from BaseSDProcess
         unet = self.sd.unet
@@ -1594,32 +1645,45 @@ class BaseSDTrainProcess(BaseTrainProcess):
         tokenizer = self.sd.tokenizer
         text_encoder = self.sd.text_encoder
         noise_scheduler = self.sd.noise_scheduler
+        print_verbose(verbose, f"Model components assigned: unet device={unet.device if hasattr(unet, 'device') else 'N/A'}, vae device={vae.device if hasattr(vae, 'device') else 'N/A'}")
 
         if self.train_config.xformers:
+            print_verbose(verbose, f"Enabling xformers memory efficient attention")
             vae.enable_xformers_memory_efficient_attention()
             unet.enable_xformers_memory_efficient_attention()
             if isinstance(text_encoder, list):
+                print_verbose(verbose, f"Enabling xformers for {len(text_encoder)} text encoders")
                 for te in text_encoder:
                     # if it has it
                     if hasattr(te, 'enable_xformers_memory_efficient_attention'):
                         te.enable_xformers_memory_efficient_attention()
+            print_verbose(verbose, f"Xformers enabled successfully")
+        else:
+            print_verbose(verbose, f"Xformers not enabled, using default attention implementation")
         
         if self.train_config.attention_backend != 'native':
+            print_verbose(verbose, f"Setting attention backend to: {self.train_config.attention_backend}")
             if hasattr(vae, 'set_attention_backend'):
                 vae.set_attention_backend(self.train_config.attention_backend)
+                print_verbose(verbose, f"VAE attention backend set")
             if hasattr(unet, 'set_attention_backend'):
                 unet.set_attention_backend(self.train_config.attention_backend)
+                print_verbose(verbose, f"UNet attention backend set")
             if isinstance(text_encoder, list):
-                for te in text_encoder:
+                for idx, te in enumerate(text_encoder):
                     if hasattr(te, 'set_attention_backend'):
                         te.set_attention_backend(self.train_config.attention_backend)
+                        print_verbose(verbose, f"Text encoder {idx} attention backend set")
             else:
                 if hasattr(text_encoder, 'set_attention_backend'):
                     text_encoder.set_attention_backend(self.train_config.attention_backend)
+                    print_verbose(verbose, f"Text encoder attention backend set")
         if self.train_config.sdp:
+            print_verbose(verbose, f"Enabling scaled dot product attention")
             torch.backends.cuda.enable_math_sdp(True)
             torch.backends.cuda.enable_flash_sdp(True)
             torch.backends.cuda.enable_mem_efficient_sdp(True)
+            print_verbose(verbose, f"Scaled dot product attention enabled")
         
         # # check if we have sage and is flux
         # if self.sd.is_flux:
@@ -1640,69 +1704,105 @@ class BaseSDTrainProcess(BaseTrainProcess):
         #         print_acc("sage attention is not installed. Using SDP instead")
 
         if self.train_config.gradient_checkpointing:
+            print_verbose(verbose, f"Enabling gradient checkpointing")
             # if has method enable_gradient_checkpointing
             if hasattr(unet, 'enable_gradient_checkpointing'):
                 unet.enable_gradient_checkpointing()
+                print_verbose(verbose, f"UNet gradient checkpointing enabled")
             elif hasattr(unet, 'gradient_checkpointing'):
                 unet.gradient_checkpointing = True
+                print_verbose(verbose, f"UNet gradient checkpointing set to True")
             else:
                 print("Gradient checkpointing not supported on this model")
+                print_verbose(verbose, f"Gradient checkpointing not supported on this model")
             if isinstance(text_encoder, list):
-                for te in text_encoder:
+                print_verbose(verbose, f"Enabling gradient checkpointing for {len(text_encoder)} text encoders")
+                for idx, te in enumerate(text_encoder):
                     if hasattr(te, 'enable_gradient_checkpointing'):
                         te.enable_gradient_checkpointing()
+                        print_verbose(verbose, f"Text encoder {idx} gradient checkpointing enabled")
                     if hasattr(te, "gradient_checkpointing_enable"):
                         te.gradient_checkpointing_enable()
+                        print_verbose(verbose, f"Text encoder {idx} gradient_checkpointing_enable called")
             else:
                 if hasattr(text_encoder, 'enable_gradient_checkpointing'):
                     text_encoder.enable_gradient_checkpointing()
+                    print_verbose(verbose, f"Text encoder gradient checkpointing enabled")
                 if hasattr(text_encoder, "gradient_checkpointing_enable"):
                     text_encoder.gradient_checkpointing_enable()
+                    print_verbose(verbose, f"Text encoder gradient_checkpointing_enable called")
 
         if self.sd.refiner_unet is not None:
+            print_verbose(verbose, f"Setting up refiner UNet: moving to {self.device_torch}, dtype={dtype}")
             self.sd.refiner_unet.to(self.device_torch, dtype=dtype)
             self.sd.refiner_unet.requires_grad_(False)
             self.sd.refiner_unet.eval()
+            print_verbose(verbose, f"Refiner UNet set to eval mode, requires_grad=False")
             if self.train_config.xformers:
                 self.sd.refiner_unet.enable_xformers_memory_efficient_attention()
+                print_verbose(verbose, f"Refiner UNet xformers enabled")
             if self.train_config.gradient_checkpointing:
                 self.sd.refiner_unet.enable_gradient_checkpointing()
+                print_verbose(verbose, f"Refiner UNet gradient checkpointing enabled")
 
         if isinstance(text_encoder, list):
-            for te in text_encoder:
+            print_verbose(verbose, f"Setting {len(text_encoder)} text encoders to eval mode, requires_grad=False")
+            for idx, te in enumerate(text_encoder):
                 te.requires_grad_(False)
                 te.eval()
+                print_verbose(verbose, f"Text encoder {idx} configured: device={te.device}")
         else:
             text_encoder.requires_grad_(False)
             text_encoder.eval()
+            print_verbose(verbose, f"Text encoder configured: device={text_encoder.device}, requires_grad=False, eval mode")
+        
+        print_verbose(verbose, f"Moving UNet to device={self.device_torch}, dtype={dtype}")
         unet.to(self.device_torch, dtype=dtype)
         unet.requires_grad_(False)
         unet.eval()
+        print_verbose(verbose, f"UNet moved: device={unet.device}, requires_grad=False, eval mode")
+        
+        print_verbose(verbose, f"Moving VAE to CPU, dtype={dtype}")
         vae = vae.to(torch.device('cpu'), dtype=dtype)
         vae.requires_grad_(False)
         vae.eval()
+        print_verbose(verbose, f"VAE moved: device={vae.device}, requires_grad=False, eval mode")
+        
         if self.train_config.learnable_snr_gos:
+            print_verbose(verbose, f"Setting up learnable SNR GOS")
             self.snr_gos = LearnableSNRGamma(
                 self.sd.noise_scheduler, device=self.device_torch
             )
             # check to see if previous settings exist
             path_to_load = os.path.join(self.save_root, 'learnable_snr.json')
             if os.path.exists(path_to_load):
+                print_verbose(verbose, f"Loading previous learnable SNR settings from: {path_to_load}")
                 with open(path_to_load, 'r') as f:
                     json_data = json.load(f)
                     if 'offset' in json_data:
                         # legacy
                         self.snr_gos.offset_2.data = torch.tensor(json_data['offset'], device=self.device_torch)
+                        print_verbose(verbose, f"Loaded legacy offset: {json_data['offset']}")
                     else:
                         self.snr_gos.offset_1.data = torch.tensor(json_data['offset_1'], device=self.device_torch)
                         self.snr_gos.offset_2.data = torch.tensor(json_data['offset_2'], device=self.device_torch)
+                        print_verbose(verbose, f"Loaded offset_1: {json_data['offset_1']}, offset_2: {json_data['offset_2']}")
                     self.snr_gos.scale.data = torch.tensor(json_data['scale'], device=self.device_torch)
                     self.snr_gos.gamma.data = torch.tensor(json_data['gamma'], device=self.device_torch)
+                    print_verbose(verbose, f"Loaded scale: {json_data['scale']}, gamma: {json_data['gamma']}")
+            else:
+                print_verbose(verbose, f"No previous learnable SNR settings found")
 
+        print_verbose(verbose, f"Executing hook_after_model_load()")
         self.hook_after_model_load()
+        
+        print_verbose(verbose, f"Flushing GPU memory cache")
         flush()
+        print_verbose(verbose, f"Memory flushed")
+        
         if not self.is_fine_tuning:
             if self.network_config is not None:
+                print_verbose(verbose, f"Setting up network (LoRA/LyCORIS): type={self.network_config.type}")
                 # TODO should we completely switch to LycorisSpecialNetwork?
                 network_kwargs = self.network_config.network_kwargs
                 is_lycoris = False
@@ -2071,25 +2171,33 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # TRAIN LOOP
         ###################################################################
 
+        print_verbose(verbose, f"========== STARTING TRAINING LOOP ==========")
+        print_verbose(verbose, f"Training from step {self.step_num} to {self.train_config.steps}")
 
         start_step_num = self.step_num
         did_first_flush = False
         flush_next = False
         for step in range(start_step_num, self.train_config.steps):
+            print_verbose(verbose, f"---------- Step {step}/{self.train_config.steps} ----------")
             if self.train_config.do_paramiter_swapping:
                 self.optimizer.optimizer.swap_paramiters()
+                print_verbose(verbose, f"Parameter swapping performed")
             self.timer.start('train_loop')
             if flush_next:
+                print_verbose(verbose, f"Flushing GPU memory (flush_next=True)")
                 flush()
+                print_verbose(verbose, f"Memory flushed")
                 flush_next = False
             if self.train_config.do_random_cfg:
                 self.train_config.do_cfg = True
                 self.train_config.cfg_scale = value_map(random.random(), 0, 1, 1.0, self.train_config.max_cfg_scale)
+                print_verbose(verbose, f"Random CFG: enabled with scale={self.train_config.cfg_scale:.3f}")
             self.step_num = step
             # default to true so various things can turn it off
             self.is_grad_accumulation_step = True
             if self.train_config.free_u:
                 self.sd.pipeline.enable_freeu(s1=0.9, s2=0.2, b1=1.1, b2=1.2)
+                print_verbose(verbose, f"FreeU enabled")
             if self.progress_bar is not None:
                 self.progress_bar.unpause()
             with torch.no_grad():
@@ -2100,18 +2208,23 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 is_sample_step = self.sample_config.sample_every and self.step_num % self.sample_config.sample_every == 0
                 if self.train_config.disable_sampling:
                     is_sample_step = False
+                print_verbose(verbose, f"Step flags: is_save_step={is_save_step}, is_sample_step={is_sample_step}, is_reg_step={is_reg_step}")
 
                 batch_list = []
 
                 for b in range(self.train_config.gradient_accumulation):
+                    print_verbose(verbose, f"  Gradient accumulation {b+1}/{self.train_config.gradient_accumulation}")
                     # keep track to alternate on an accumulation step for reg   
                     batch_step = step
                     # don't do a reg step on sample or save steps as we dont want to normalize on those
                     if batch_step % 2 == 0 and dataloader_reg is not None and not is_save_step and not is_sample_step:
+                        print_verbose(verbose, f"    Loading regularization batch")
                         try:
                             with self.timer('get_batch:reg'):
                                 batch = next(dataloader_iterator_reg)
+                            print_verbose(verbose, f"    Reg batch loaded successfully")
                         except StopIteration:
+                            print_verbose(verbose, f"    Reg dataloader exhausted, resetting and triggering epoch setup")
                             with self.timer('reset_batch:reg'):
                                 # hit the end of an epoch, reset
                                 if self.progress_bar is not None:
@@ -2123,12 +2236,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 batch = next(dataloader_iterator_reg)
                             if self.progress_bar is not None:
                                 self.progress_bar.unpause()
+                            print_verbose(verbose, f"    Reg batch loaded after reset")
                         is_reg_step = True
                     elif dataloader is not None:
+                        print_verbose(verbose, f"    Loading training batch")
                         try:
                             with self.timer('get_batch'):
                                 batch = next(dataloader_iterator)
+                            print_verbose(verbose, f"    Training batch loaded successfully")
                         except StopIteration:
+                            print_verbose(verbose, f"    Training dataloader exhausted, resetting and triggering epoch setup")
                             with self.timer('reset_batch'):
                                 # hit the end of an epoch, reset
                                 if self.progress_bar is not None:
@@ -2136,22 +2253,27 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 dataloader_iterator = iter(dataloader)
                                 trigger_dataloader_setup_epoch(dataloader)
                                 self.epoch_num += 1
+                                print_verbose(verbose, f"    Epoch incremented to {self.epoch_num}")
                                 if self.train_config.gradient_accumulation_steps == -1:
                                     # if we are accumulating for an entire epoch, trigger a step
                                     self.is_grad_accumulation_step = False
                                     self.grad_accumulation_step = 0
+                                    print_verbose(verbose, f"    Gradient accumulation triggered by epoch end")
                             with self.timer('get_batch'):
                                 batch = next(dataloader_iterator)
                             if self.progress_bar is not None:
                                 self.progress_bar.unpause()
+                            print_verbose(verbose, f"    Training batch loaded after reset")
                     else:
                         batch = None
+                        print_verbose(verbose, f"    No dataloader available, batch=None")
                     batch_list.append(batch)
                     batch_step += 1
 
                 # setup accumulation
                 if self.train_config.gradient_accumulation_steps == -1:
                     # epoch is handling the accumulation, dont touch it
+                    print_verbose(verbose, f"  Gradient accumulation handled by epoch (-1 mode)")
                     pass
                 else:
                     # determine if we are accumulating or not
@@ -2160,32 +2282,43 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     optimizer_step_at = self.train_config.gradient_accumulation_steps
                     is_optimizer_step = self.grad_accumulation_step >= optimizer_step_at
                     self.is_grad_accumulation_step = not is_optimizer_step
+                    print_verbose(verbose, f"  Accumulation check: grad_accumulation_step={self.grad_accumulation_step}, optimizer_step_at={optimizer_step_at}, is_optimizer_step={is_optimizer_step}")
                     if is_optimizer_step:
                         self.grad_accumulation_step = 0
+                        print_verbose(verbose, f"  Resetting grad_accumulation_step to 0")
 
             # flush()
             ### HOOK ###
             if self.torch_profiler is not None:
                 self.torch_profiler.start()
+                print_verbose(verbose, f"  Torch profiler started")
             did_oom = False
             loss_dict = None
             try:
+                print_verbose(verbose, f"  Executing hook_train_loop with {len(batch_list)} batches")
                 with self.accelerator.accumulate(self.modules_being_trained):
                     loss_dict = self.hook_train_loop(batch_list)
+                print_verbose(verbose, f"  hook_train_loop completed successfully, loss_dict={loss_dict}")
             except torch.cuda.OutOfMemoryError:
                 did_oom = True
+                print_verbose(verbose, f"  CUDA OOM detected")
             except RuntimeError as e:
                 if "CUDA out of memory" in str(e):
                     did_oom = True
+                    print_verbose(verbose, f"  RuntimeError OOM detected: {e}")
                 else:
                     raise  # not an OOM; surface real errors
             if did_oom:
                 self.num_consecutive_oom += 1
+                print_verbose(verbose, f"  OOM handling: consecutive_oom={self.num_consecutive_oom}/3")
                 if self.num_consecutive_oom > 3:
                     raise RuntimeError("OOM during training step 3 times in a row, aborting training")
                 optimizer.zero_grad(set_to_none=True)
+                print_verbose(verbose, f"  Zeroing gradients due to OOM")
                 flush()
+                print_verbose(verbose, f"  Flushing GPU memory due to OOM")
                 torch.cuda.ipc_collect()
+                print_verbose(verbose, f"  IPC collect called")
                 # skip this step and keep going
                 print_acc("")
                 print_acc("################################################")
@@ -2197,17 +2330,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if self.torch_profiler is not None:
                 torch.cuda.synchronize()  # Make sure all CUDA ops are done
                 self.torch_profiler.stop()
+                print_verbose(verbose, f"  Torch profiler stopped")
                 
                 print("\n==== Profile Results ====")
                 print(self.torch_profiler.key_averages().table(sort_by="cpu_time_total", row_limit=1000))
             self.timer.stop('train_loop')
             if not did_first_flush:
+                print_verbose(verbose, f"  First flush after training start")
                 flush()
+                print_verbose(verbose, f"  First flush completed")
                 did_first_flush = True
             # flush()
             # setup the networks to gradient checkpointing and everything works
             if self.adapter is not None and isinstance(self.adapter, ReferenceAdapter):
                 self.adapter.clear_memory()
+                print_verbose(verbose, f"  Reference adapter memory cleared")
 
             with torch.no_grad():
                 # torch.cuda.empty_cache()
@@ -2226,6 +2363,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         )
                     else:
                         learning_rate = optimizer.param_groups[0]['lr']
+                    print_verbose(verbose, f"  Learning rate: {learning_rate:.6e}")
 
                     prog_bar_string = f"lr: {learning_rate:.1e}"
                     for key, value in loss_dict.items():
@@ -2243,18 +2381,23 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if self.step_num != self.start_step:
                     if is_sample_step or is_save_step:
                         self.accelerator.wait_for_everyone()
+                        print_verbose(verbose, f"  Waiting for all processes (save or sample step)")
                         
                     if is_save_step:
-                        self.accelerator
                         # print above the progress bar
                         if self.progress_bar is not None:
                             self.progress_bar.pause()
                         print_acc(f"\nSaving at step {self.step_num}")
+                        print_verbose(verbose, f"  ==== SAVING CHECKPOINT at step {self.step_num} ====")
                         self.save(self.step_num)
+                        print_verbose(verbose, f"  Checkpoint saved successfully")
                         self.ensure_params_requires_grad()
+                        print_verbose(verbose, f"  Ensured params require grad")
                         # clear any grads
                         optimizer.zero_grad()
+                        print_verbose(verbose, f"  Optimizer gradients zeroed after save")
                         flush()
+                        print_verbose(verbose, f"  GPU memory flushed after save")
                         flush_next = True
                         if self.progress_bar is not None:
                             self.progress_bar.unpause()
@@ -2262,15 +2405,22 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     if is_sample_step:
                         if self.progress_bar is not None:
                             self.progress_bar.pause()
+                        print_verbose(verbose, f"  ==== SAMPLING at step {self.step_num} ====")
                         flush()
+                        print_verbose(verbose, f"  Flushing GPU memory before sampling")
                         # print above the progress bar
                         if self.train_config.free_u:
                             self.sd.pipeline.disable_freeu()
+                            print_verbose(verbose, f"  FreeU disabled for sampling")
                         self.sample(self.step_num)
+                        print_verbose(verbose, f"  Sampling completed")
                         if self.train_config.unload_text_encoder:
                             # make sure the text encoder is unloaded
+                            print_verbose(verbose, f"  Unloading text encoder to CPU")
                             self.sd.text_encoder_to('cpu')
+                            print_verbose(verbose, f"  Text encoder moved to CPU")
                         flush()
+                        print_verbose(verbose, f"  GPU memory flushed after sampling")
 
                         self.ensure_params_requires_grad()
                         if self.progress_bar is not None:
