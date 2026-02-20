@@ -63,7 +63,7 @@ def unload_text_encoder(model: "BaseModel"):
                 print_verbose(verbose, f"Unloading {te_name}: moving from {te_obj.device} to CPU")
                 te = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
                 text_encoder_list.append(te)
-                te_obj = te_obj.to('cpu')
+                te_obj.to('cpu')
                 print_verbose(verbose, f"{te_name} moved to CPU, replacing with FakeTextEncoder")
                 setattr(pipe, te_name, te)
                 i += 1
