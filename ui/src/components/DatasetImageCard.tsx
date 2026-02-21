@@ -30,7 +30,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   const [isCaptionLoaded, setIsCaptionLoaded] = useState<boolean>(false);
   const [caption, setCaption] = useState<string>('');
   const [savedCaption, setSavedCaption] = useState<string>('');
-  const [imageKey, setImageKey] = useState<number>(0);
+  const [imageKey, setImageKey] = useState<number>(Date.now());
   const isGettingCaption = useRef<boolean>(false);
 
   const fetchCaption = async () => {
