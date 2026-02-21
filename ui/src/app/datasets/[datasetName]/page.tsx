@@ -107,7 +107,7 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
           </Button>
         </div>
         <div>
-          <h1 className="text-lg">Dataset: {datasetName}</h1>
+          <h1 className="text-lg">Dataset: {datasetName}, Images: {imgList.length}</h1>
         </div>
         <div className="flex-1"></div>
         <div>
