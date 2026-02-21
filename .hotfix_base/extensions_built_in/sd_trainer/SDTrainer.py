@@ -21,7 +21,6 @@ from toolkit.image_utils import show_tensors, show_latents
 from toolkit.ip_adapter import IPAdapter
 from toolkit.custom_adapter import CustomAdapter
 from toolkit.print import print_acc
-from toolkit.print import print_verbose
 from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
@@ -113,6 +112,54 @@ class SDTrainer(BaseSDTrainProcess):
             self._guidance_loss_target_batch = float(self.train_config.guidance_loss_target[0])
         else:
             raise ValueError(f"Unknown guidance loss target type {type(self.train_config.guidance_loss_target)}")
+
+        # strict-audio monitoring
+        self._audio_expected_batches = 0
+        self._audio_supervised_batches = 0
+
+    def _validate_audio_supervision(self, batch: DataLoaderBatchDTO):
+        if not getattr(self.train_config, "strict_audio_mode", False):
+            return
+        if batch is None or batch.dataset_config is None:
+            return
+
+        expects_audio = bool(
+            getattr(batch.dataset_config, "do_audio", False)
+            and getattr(batch.dataset_config, "num_frames", 1) > 1
+        )
+        if not expects_audio:
+            return
+
+        self._audio_expected_batches += 1
+
+        has_real_audio_data = bool(
+            batch.audio_data is not None and any([item is not None for item in batch.audio_data])
+        )
+        has_cached_audio_latents = batch.audio_latents is not None
+        has_audio_supervision = (
+            batch.audio_loss is not None
+            or (batch.audio_pred is not None and batch.audio_target is not None)
+        )
+
+        if has_audio_supervision and (has_real_audio_data or has_cached_audio_latents):
+            self._audio_supervised_batches += 1
+
+        warmup_steps = int(getattr(self.train_config, "strict_audio_warmup_steps", 50))
+        if self.step_num < warmup_steps:
+            return
+
+        if self._audio_expected_batches <= 0:
+            return
+
+        min_ratio = float(getattr(self.train_config, "strict_audio_min_supervised_ratio", 0.9))
+        current_ratio = self._audio_supervised_batches / float(self._audio_expected_batches)
+        if current_ratio < min_ratio:
+            raise ValueError(
+                "Strict audio mode triggered: insufficient audio supervision for audio-enabled video batches. "
+                f"ratio={current_ratio:.3f}, required>={min_ratio:.3f}, "
+                f"expected_batches={self._audio_expected_batches}, supervised_batches={self._audio_supervised_batches}. "
+                "Check dataset audio extraction, ensure clips have valid audio, and verify do_audio is enabled."
+            )
 
 
     def before_model_load(self):
@@ -861,11 +908,60 @@ class SDTrainer(BaseSDTrainProcess):
 
         loss = loss.mean()
         
+        # automatic audio loss balancing
+        if getattr(self.train_config, "auto_balance_audio_loss", False) and (batch.audio_loss is not None or (batch.audio_pred is not None and batch.audio_target is not None)):
+            if not hasattr(self, "_ema_video_loss"):
+                self._ema_video_loss = loss.item()
+                self._ema_audio_loss = batch.audio_loss.item() if batch.audio_loss is not None else torch.nn.functional.mse_loss(batch.audio_pred.float(), batch.audio_target.float(), reduction="mean").item()
+            else:
+                alpha = 0.99
+                self._ema_video_loss = alpha * self._ema_video_loss + (1 - alpha) * loss.item()
+                curr_audio_loss = batch.audio_loss.item() if batch.audio_loss is not None else torch.nn.functional.mse_loss(batch.audio_pred.float(), batch.audio_target.float(), reduction="mean").item()
+                self._ema_audio_loss = alpha * self._ema_audio_loss + (1 - alpha) * curr_audio_loss
+            
+            # Target audio loss to be ~25% of total loss -> audio_loss = 0.33 * video_loss
+            target_audio_loss_mag = 0.33 * max(self._ema_video_loss, 1e-6)
+            if self._ema_audio_loss > 1e-6:
+                dynamic_multiplier = target_audio_loss_mag / self._ema_audio_loss
+            else:
+                dynamic_multiplier = 1.0
+            
+            # clamp multiplier to sane values to prevent instability
+            dynamic_multiplier = max(0.05, min(20.0, dynamic_multiplier))
+            self.train_config.audio_loss_multiplier = dynamic_multiplier
+
         # check for audio loss
-        if batch.audio_pred is not None and batch.audio_target is not None:
-            audio_loss = torch.nn.functional.mse_loss(batch.audio_pred.float(), batch.audio_target.float(), reduction="mean")
-            audio_loss = audio_loss * self.train_config.audio_loss_multiplier
+        raw_audio_loss_val = None
+        scaled_audio_loss_val = None
+        if batch.audio_loss is not None:
+            audio_loss = batch.audio_loss
+            raw_audio_loss_val = audio_loss.item()
+            if hasattr(self.train_config, "audio_loss_multiplier"):
+                audio_loss = audio_loss * self.train_config.audio_loss_multiplier
+            scaled_audio_loss_val = audio_loss.item()
             loss = loss + audio_loss
+        elif batch.audio_pred is not None and batch.audio_target is not None:
+            audio_loss = torch.nn.functional.mse_loss(
+                batch.audio_pred.float(), batch.audio_target.float(), reduction="mean"
+            )
+            raw_audio_loss_val = audio_loss.item()
+            if hasattr(self.train_config, "audio_loss_multiplier"):
+                audio_loss = audio_loss * self.train_config.audio_loss_multiplier
+            scaled_audio_loss_val = audio_loss.item()
+            loss = loss + audio_loss
+
+        if raw_audio_loss_val is not None:
+            if not hasattr(self, '_audio_log_interval'):
+                self._audio_log_interval = 0
+            self._audio_log_interval += 1
+            if self._audio_log_interval % 10 == 1:
+                multiplier_str = ""
+                if getattr(self.train_config, "auto_balance_audio_loss", False):
+                    multiplier_str = f", dyn_mult={self.train_config.audio_loss_multiplier:.2f}"
+                self.print_and_status_update(
+                    f"[audio] raw={raw_audio_loss_val:.5f}, scaled={scaled_audio_loss_val:.5f}, "
+                    f"video={loss.item() - scaled_audio_loss_val:.5f}{multiplier_str}"
+                )
 
         # check for additional losses
         if self.adapter is not None and hasattr(self.adapter, "additional_loss") and self.adapter.additional_loss is not None:
@@ -1188,14 +1284,11 @@ class SDTrainer(BaseSDTrainProcess):
         is_primary_pred: bool = False,
         **kwargs,
     ):
-        verbose = self.model_config.verbose if hasattr(self.model_config, 'verbose') else False
-        if is_primary_pred:
-            print_verbose(verbose, f"predict_noise() called (primary prediction): latents shape={noisy_latents.shape}, timesteps={timesteps}")
         dtype = get_torch_dtype(self.train_config.dtype)
         guidance_embedding_scale = self.train_config.cfg_scale
         if self.train_config.do_guidance_loss:
             guidance_embedding_scale = self._guidance_loss_target_batch
-        result = self.sd.predict_noise(
+        return self.sd.predict_noise(
             latents=noisy_latents.to(self.device_torch, dtype=dtype),
             conditional_embeddings=conditional_embeds.to(self.device_torch, dtype=dtype),
             unconditional_embeddings=unconditional_embeds,
@@ -1208,9 +1301,6 @@ class SDTrainer(BaseSDTrainProcess):
             batch=batch,
             **kwargs
         )
-        if is_primary_pred:
-            print_verbose(verbose, f"predict_noise() completed, result shape={result.shape}")
-        return result
     
 
     def train_single_accumulation(self, batch: DataLoaderBatchDTO):
@@ -2042,22 +2132,18 @@ class SDTrainer(BaseSDTrainProcess):
                     # else:
                     self.accelerator.backward(loss)
 
+        self._validate_audio_supervision(batch)
         return loss.detach()
         # flush()
 
     def hook_train_loop(self, batch: Union[DataLoaderBatchDTO, List[DataLoaderBatchDTO]]):
-        verbose = self.model_config.verbose if hasattr(self.model_config, 'verbose') else False
-        print_verbose(verbose, f"hook_train_loop() called at step {self.step_num}")
         if isinstance(batch, list):
             batch_list = batch
         else:
             batch_list = [batch]
-        print_verbose(verbose, f"Processing {len(batch_list)} batches for gradient accumulation")
         total_loss = None
         self.optimizer.zero_grad()
-        print_verbose(verbose, f"Optimizer gradients zeroed")
-        for idx, batch in enumerate(batch_list):
-            print_verbose(verbose, f"Training batch {idx+1}/{len(batch_list)}")
+        for batch in batch_list:
             if self.sd.is_multistage:
                 # handle multistage switching
                 if self.steps_this_boundary >= self.train_config.switch_boundary_every or self.current_boundary_index not in self.sd.trainable_multistage_boundaries:
@@ -2069,10 +2155,8 @@ class SDTrainer(BaseSDTrainProcess):
                             self.current_boundary_index = 0
                         if self.current_boundary_index in self.sd.trainable_multistage_boundaries:
                             # if this boundary is trainable, we can stop looking
-                            print_verbose(verbose, f"Switched to multistage boundary {self.current_boundary_index}")
                             break
             loss = self.train_single_accumulation(batch)
-            print_verbose(verbose, f"Batch {idx+1} loss: {loss.item():.4f}")
             self.steps_this_boundary += 1
             if total_loss is None:
                 total_loss = loss
@@ -2080,11 +2164,9 @@ class SDTrainer(BaseSDTrainProcess):
                 total_loss += loss
             if len(batch_list) > 1 and self.model_config.low_vram:
                 torch.cuda.empty_cache()
-                print_verbose(verbose, f"Cleared CUDA cache (low_vram mode)")
 
 
         if not self.is_grad_accumulation_step:
-            print_verbose(verbose, f"Performing optimizer step (not accumulating)")
             # fix this for multi params
             if self.train_config.optimizer != 'adafactor':
                 if isinstance(self.params[0], dict):
@@ -2092,11 +2174,9 @@ class SDTrainer(BaseSDTrainProcess):
                         self.accelerator.clip_grad_norm_(self.params[i]['params'], self.train_config.max_grad_norm)
                 else:
                     self.accelerator.clip_grad_norm_(self.params, self.train_config.max_grad_norm)
-                print_verbose(verbose, f"Gradients clipped to max_norm={self.train_config.max_grad_norm}")
             # only step if we are not accumulating
             with self.timer('optimizer_step'):
                 self.optimizer.step()
-                print_verbose(verbose, f"Optimizer stepped")
 
                 self.optimizer.zero_grad(set_to_none=True)
                 if self.adapter and isinstance(self.adapter, CustomAdapter):
@@ -2104,16 +2184,13 @@ class SDTrainer(BaseSDTrainProcess):
             if self.ema is not None:
                 with self.timer('ema_update'):
                     self.ema.update()
-                print_verbose(verbose, f"EMA updated")
         else:
             # gradient accumulation. Just a place for breakpoint
-            print_verbose(verbose, f"Gradient accumulation step, not performing optimizer step yet")
             pass
 
         # TODO Should we only step scheduler on grad step? If so, need to recalculate last step
         with self.timer('scheduler_step'):
             self.lr_scheduler.step()
-        print_verbose(verbose, f"Learning rate scheduler stepped")
 
         if self.embedding is not None:
             with self.timer('restore_embeddings'):
@@ -2127,7 +2204,6 @@ class SDTrainer(BaseSDTrainProcess):
         loss_dict = OrderedDict(
             {'loss': (total_loss / len(batch_list)).item()}
         )
-        print_verbose(verbose, f"hook_train_loop() completed with average loss: {loss_dict['loss']:.4f}")
 
         self.end_of_training_loop()
 

@@ -20,9 +20,22 @@ type AdditionalSections =
   | 'datasets.do_audio'
   | 'datasets.audio_normalize'
   | 'datasets.audio_preserve_pitch'
+  | 'train.audio_loss_multiplier'
+  | 'train.auto_balance_audio_loss'
+  | 'train.strict_audio_mode'
+  | 'train.strict_audio_min_supervised_ratio'
+  | 'train.strict_audio_warmup_steps'
+  | 'train.independent_audio_timestep'
+  | 'train.noise_offset'
+  | 'train.min_snr_gamma'
+  | 'train.lr_scheduler'
+  | 'train.caption_dropout_rate'
+  | 'train.diff_output_preservation'
+  | 'network.type'
+  | 'network.rank_dropout'
+  | 'network.module_dropout'
   | 'sample.ctrl_img'
   | 'sample.multi_ctrl_imgs'
-  | 'train.audio_loss_multiplier'
   | 'datasets.num_frames'
   | 'model.multistage'
   | 'model.layer_offloading'
@@ -644,13 +657,46 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].sample.width': [768, 1024],
       'config.process[0].sample.height': [768, 1024],
       'config.process[0].train.audio_loss_multiplier': [1.0, undefined],
+      'config.process[0].train.auto_balance_audio_loss': [true, undefined],
+      'config.process[0].train.independent_audio_timestep': [true, undefined],
+      'config.process[0].train.strict_audio_mode': [false, undefined],
+      'config.process[0].train.strict_audio_min_supervised_ratio': [0.9, undefined],
+      'config.process[0].train.strict_audio_warmup_steps': [50, undefined],
+      'config.process[0].train.noise_offset': [0.05, undefined],
+      'config.process[0].train.min_snr_gamma': [5.0, undefined],
       'config.process[0].train.timestep_type': ['weighted', 'sigmoid'],
+      'config.process[0].network.linear': [32, undefined],
+      'config.process[0].network.linear_alpha': [32, undefined],
+      'config.process[0].network.rank_dropout': [0.1, undefined],
       'config.process[0].datasets[x].do_i2v': [false, undefined],
       'config.process[0].datasets[x].do_audio': [true, undefined],
       'config.process[0].datasets[x].fps': [24, undefined],
     },
     disableSections: ['network.conv'],
-    additionalSections: ['sample.ctrl_img', 'datasets.num_frames', 'model.layer_offloading', 'model.low_vram', 'datasets.do_audio', 'datasets.audio_normalize', 'datasets.audio_preserve_pitch', 'datasets.do_i2v', 'train.audio_loss_multiplier'],
+    additionalSections: [
+      'sample.ctrl_img',
+      'datasets.num_frames',
+      'model.layer_offloading',
+      'model.low_vram',
+      'datasets.do_audio',
+      'datasets.audio_normalize',
+      'datasets.audio_preserve_pitch',
+      'datasets.do_i2v',
+      'network.type',
+      'network.rank_dropout',
+      'network.module_dropout',
+      'train.audio_loss_multiplier',
+      'train.auto_balance_audio_loss',
+      'train.independent_audio_timestep',
+      'train.strict_audio_mode',
+      'train.strict_audio_min_supervised_ratio',
+      'train.strict_audio_warmup_steps',
+      'train.noise_offset',
+      'train.min_snr_gamma',
+      'train.lr_scheduler',
+      'train.caption_dropout_rate',
+      'train.diff_output_preservation',
+    ],
   },
   {
     name: 'flux2_klein_4b',

@@ -112,8 +112,8 @@ const docs: { [key: string]: ConfigDoc } = {
     description: (
       <>
         For models that support audio with video, this option will load the audio from the video and resize it to match
-        the video sequence. Since the video is automatically resized, the audio may drop or raise in pitch to match the
-        new speed of the video. It is important to prep your dataset to have the proper length before training.
+        the video sequence. Since the video is automatically resized, the audio may drop or raise in pitch to match the new
+        speed of the video. It is important to prep your dataset to have the proper length before training.
       </>
     ),
   },
@@ -121,9 +121,8 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'Audio Normalize',
     description: (
       <>
-        When loading audio, this will normalize the audio volume to the max peaks. Useful if your dataset has varying
-        audio volumes. Warning, do not use if you have clips with full silence you want to keep, as it will raise the
-        volume of those clips.
+        When loading audio, this will normalize the audio volume to the max peaks. Useful if your dataset has varying audio
+        volumes. Warning, do not use if you have clips with full silence you want to keep, as it will raise the volume of those clips.
       </>
     ),
   },
@@ -133,7 +132,7 @@ const docs: { [key: string]: ConfigDoc } = {
       <>
         When loading audio to match the number of frames requested, this option will preserve the pitch of the audio if
         the length does not match training target. It is recommended to have a dataset that matches your target length,
-        as this option can add sound distortions.
+        as this option can add sound distortions. 
       </>
     ),
   },
@@ -159,6 +158,126 @@ const docs: { [key: string]: ConfigDoc } = {
       <>
         Unloading text encoder will cache the trigger word and the sample prompts and unload the text encoder from the
         GPU. Captions in for the dataset will be ignored
+      </>
+    ),
+  },
+  'train.audio_loss_multiplier': {
+    title: 'Audio Loss Multiplier',
+    description: (
+      <>
+        When training joint audio-video models, video loss can dominate and weaken voice learning. Increase this value to
+        strengthen audio supervision. Start with 2.0 to 10.0 and tune carefully. Too high can overfit audio and hurt
+        overall quality.
+      </>
+    ),
+  },
+  'train.auto_balance_audio_loss': {
+    title: 'Auto Balance Audio Loss',
+    description: (
+      <>
+        Automatically adjusts audio loss strength during training using running loss statistics, so audio supervision
+        stays strong without manually tuning a multiplier. Recommended for most LTX-2 audio jobs.
+      </>
+    ),
+  },
+  'train.strict_audio_mode': {
+    title: 'Strict Audio Mode',
+    description: (
+      <>
+        Fails training early if audio-enabled video batches are frequently missing effective audio supervision. Use this
+        to catch dataset/extraction problems early instead of discovering broken audio after long runs.
+      </>
+    ),
+  },
+  'train.strict_audio_min_supervised_ratio': {
+    title: 'Strict Audio Min Supervised Ratio',
+    description: (
+      <>
+        Minimum required ratio of supervised audio batches when strict audio mode is enabled. Example: 0.9 means at least
+        90% of expected audio batches must have valid supervision.
+      </>
+    ),
+  },
+  'train.strict_audio_warmup_steps': {
+    title: 'Strict Audio Warmup Steps',
+    description: (
+      <>
+        Number of initial training steps to ignore before strict audio checks begin. This avoids false positives during
+        startup and data-loader warmup.
+      </>
+    ),
+  },
+  'train.independent_audio_timestep': {
+    title: 'Independent Audio Timestep',
+    description: (
+      <>
+        Samples a separate random denoising timestep for audio on each training step instead of using the same timestep
+        as video. The LTX-2 transformer was designed for independent audio/video timestep processing. Enabling this
+        lets each modality learn at its own optimal noise level, significantly improving voice quality. Enabled by default.
+      </>
+    ),
+  },
+  'train.noise_offset': {
+    title: 'Noise Offset',
+    description: (
+      <>
+        Adds a small offset to training noise, improving the model's ability to generate very bright and very dark
+        content. Recommended value: 0.03 to 0.1. Set to 0 to disable.
+      </>
+    ),
+  },
+  'train.min_snr_gamma': {
+    title: 'Min-SNR Gamma',
+    description: (
+      <>
+        Applies minimum Signal-to-Noise Ratio weighting to balance loss across all noise levels. Prevents the model
+        from over-focusing on easy (low-noise) timesteps. Recommended: 5.0. Set to 0 to disable.
+      </>
+    ),
+  },
+  'train.lr_scheduler': {
+    title: 'LR Scheduler',
+    description: (
+      <>
+        Learning rate schedule strategy. Constant with warmup is safe for short runs. Cosine annealing produces
+        better quality for longer training runs by gradually reducing the learning rate.
+      </>
+    ),
+  },
+  'train.caption_dropout_rate': {
+    title: 'Caption Dropout Rate',
+    description: (
+      <>
+        Probability of dropping the caption for each training sample. Forces the model to learn visual/audio features
+        without relying on text, improving prompt generalization. Recommended: 0.05. Not compatible with text embedding caching.
+      </>
+    ),
+  },
+  'network.type': {
+    title: 'Network Type',
+    description: (
+      <>
+        LoRA variant to use. Standard LoRA is well-tested. DoRA (Weight-Decomposed LoRA) decomposes weight updates
+        into magnitude and direction, often producing higher quality results at the same rank. LoKr uses Kronecker
+        product factorization for more efficient parameter usage.
+      </>
+    ),
+  },
+  'network.rank_dropout': {
+    title: 'Rank Dropout',
+    description: (
+      <>
+        Randomly zeroes entire rank dimensions during training. Acts as strong regularization that prevents overfitting
+        while allowing higher rank for more capacity. Recommended: 0.1 for rank 32. Set to 0 to disable.
+      </>
+    ),
+  },
+  'network.module_dropout': {
+    title: 'Module Dropout',
+    description: (
+      <>
+        Randomly skips entire LoRA modules per training step. Forces the model to be robust across all layers.
+        More aggressive than rank dropout. Start with 0.0 unless overfitting is severe.
       </>
     ),
   },
@@ -311,21 +430,10 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'Num Repeats',
     description: (
       <>
-        Number of Repeats will allow you to repeate the items in a dataset multiple times. This is useful when you are
-        using multiple datasets and want to balance the number of samples from each dataset. For instance, if you have a
-        small dataset of 10 images and a large dataset of 100 images, you can set the small dataset to have 10 repeats
-        to effectively make it 100 images, making the two datasets occour equally during training.
-      </>
-    ),
-  },
-  'train.audio_loss_multiplier': {
-    title: 'Audio Loss Multiplier',
-    description: (
-      <>
-        When training audio and video, sometimes the video loss is so great that it outweights the audio loss, causing
-        the audio to become distorted. If you are noticing this happen, you can increase the audio loss multiplier to
-        give more weight to the audio loss. You could try something like 2.0, 10.0 etc. Warning, setting this too high
-        could overfit and damage the model.
+        Number of Repeats will allow you to repeate the items in a dataset multiple times. This is useful when you are using multiple
+        datasets and want to balance the number of samples from each dataset. For instance, if you have a small dataset of 10 images 
+        and a large dataset of 100 images, you can set the small dataset to have 10 repeats to effectively make it 100 images, making
+        the two datasets occour equally during training.
       </>
     ),
   },

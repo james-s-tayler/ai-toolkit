@@ -65,6 +65,9 @@ export interface NetworkConfig {
   linear_alpha: number;
   conv: number;
   conv_alpha: number;
+  dropout?: number;
+  rank_dropout?: number;
+  module_dropout?: number;
   lokr_full_rank: boolean;
   lokr_factor: number;
   network_kwargs: {
@@ -144,9 +147,17 @@ export interface TrainConfig {
   blank_prompt_preservation_multiplier?: number;
   switch_boundary_every: number;
   loss_type: 'mse' | 'mae' | 'wavelet' | 'stepped';
+  audio_loss_multiplier?: number;
+  auto_balance_audio_loss?: boolean;
+  independent_audio_timestep?: boolean;
+  strict_audio_mode?: boolean;
+  strict_audio_min_supervised_ratio?: number;
+  strict_audio_warmup_steps?: number;
+  noise_offset?: number;
+  min_snr_gamma?: number;
+  lr_scheduler?: string;
   do_differential_guidance?: boolean;
   differential_guidance_scale?: number;
-  audio_loss_multiplier?: number;
 }
 
 export interface QuantizeKwargsConfig {
