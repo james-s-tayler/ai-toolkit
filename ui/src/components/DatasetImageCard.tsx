@@ -1,5 +1,5 @@
 import React, { useRef, useEffect, useState, ReactNode, KeyboardEvent } from 'react';
-import { FaTrashAlt, FaEye, FaEyeSlash } from 'react-icons/fa';
+import { FaTrashAlt, FaEye, FaEyeSlash, FaExpand } from 'react-icons/fa';
 import { openConfirm } from './ConfirmModal';
 import classNames from 'classnames';
 import { apiClient } from '@/utils/api';
@@ -12,6 +12,7 @@ interface DatasetImageCardProps {
   children?: ReactNode;
   className?: string;
   onDelete?: () => void;
+  onEnlarge?: () => void;
 }
 
 const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
@@ -20,6 +21,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   children,
   className = '',
   onDelete = () => {},
+  onEnlarge,
 }) => {
   const cardRef = useRef<HTMLDivElement>(null);
   const [isVisible, setIsVisible] = useState<boolean>(false);
@@ -159,9 +161,10 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
                   src={`/api/img/${encodeURIComponent(imageUrl)}`}
                   alt={alt}
                   onLoad={handleLoad}
+                  onClick={onEnlarge}
                   className={`w-full h-full object-contain transition-opacity duration-300 ${
                     loaded ? 'opacity-100' : 'opacity-0'
-                  }`}
+                  } ${onEnlarge ? 'cursor-pointer' : ''}`}
                 />
               )}
             </>
@@ -173,6 +176,15 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
           )}
           {children && <div className="absolute inset-0 flex items-center justify-center">{children}</div>}
           <div className="absolute top-1 right-1 flex space-x-2 z-10">
+            {onEnlarge && isItImage && (
+              <button
+                className="bg-gray-800 rounded-full p-2"
+                onClick={onEnlarge}
+                aria-label="Enlarge image"
+              >
+                <FaExpand />
+              </button>
+            )}
             <button
               className="bg-gray-800 rounded-full p-2"
               onClick={() => {
