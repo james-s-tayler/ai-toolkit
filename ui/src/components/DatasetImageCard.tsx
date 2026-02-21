@@ -1,5 +1,5 @@
 import React, { useRef, useEffect, useState, ReactNode, KeyboardEvent } from 'react';
-import { FaTrashAlt, FaEye, FaEyeSlash, FaExpand } from 'react-icons/fa';
+import { FaTrashAlt, FaEye, FaEyeSlash, FaExpand, FaUndoAlt, FaRedoAlt } from 'react-icons/fa';
 import { openConfirm } from './ConfirmModal';
 import classNames from 'classnames';
 import { apiClient } from '@/utils/api';
@@ -30,6 +30,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   const [isCaptionLoaded, setIsCaptionLoaded] = useState<boolean>(false);
   const [caption, setCaption] = useState<string>('');
   const [savedCaption, setSavedCaption] = useState<string>('');
+  const [imageKey, setImageKey] = useState<number>(Date.now());
   const isGettingCaption = useRef<boolean>(false);
 
   const fetchCaption = async () => {
@@ -68,6 +69,18 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
       })
       .catch(error => {
         console.error('Error saving caption:', error);
+      });
+  };
+
+  const rotateImage = (direction: 'left' | 'right') => {
+    apiClient
+      .post('/api/img/rotate', { imgPath: imageUrl, direction })
+      .then(() => {
+        setLoaded(false);
+        setImageKey(prev => prev + 1);
+      })
+      .catch(error => {
+        console.error('Error rotating image:', error);
       });
   };
 
@@ -158,7 +171,8 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
               )}
               {isItImage && (
                 <img
-                  src={`/api/img/${encodeURIComponent(imageUrl)}`}
+                  key={imageKey}
+                  src={`/api/img/${encodeURIComponent(imageUrl)}?v=${imageKey}`}
                   alt={alt}
                   onLoad={handleLoad}
                   onClick={onEnlarge}
@@ -183,6 +197,24 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
                 aria-label="Enlarge image"
               >
                 <FaExpand />
+              </button>
+            )}
+            {isItImage && (
+              <button
+                className="bg-gray-800 rounded-full p-2"
+                onClick={() => rotateImage('left')}
+                aria-label="Rotate image left"
+              >
+                <FaUndoAlt />
+              </button>
+            )}
+            {isItImage && (
+              <button
+                className="bg-gray-800 rounded-full p-2"
+                onClick={() => rotateImage('right')}
+                aria-label="Rotate image right"
+              >
+                <FaRedoAlt />
               </button>
             )}
             <button
