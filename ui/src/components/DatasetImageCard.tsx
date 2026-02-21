@@ -176,12 +176,6 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
             <button
               className="bg-gray-800 rounded-full p-2"
               onClick={() => {
-                openConfirm({
-                  title: `Delete ${isItAVideo ? 'video' : 'image'}`,
-                  message: `Are you sure you want to delete this ${isItAVideo ? 'video' : 'image'}? This action cannot be undone.`,
-                  type: 'warning',
-                  confirmText: 'Delete',
-                  onConfirm: () => {
                     apiClient
                       .post('/api/img/delete', { imgPath: imageUrl })
                       .then(() => {
@@ -191,9 +185,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
                       .catch(error => {
                         console.error('Error deleting image:', error);
                       });
-                  },
-                });
-              }}
+                  }}
             >
               <FaTrashAlt />
             </button>
