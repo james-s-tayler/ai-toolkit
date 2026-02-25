@@ -1,9 +1,9 @@
 import React, { useRef, useEffect, useState, ReactNode, KeyboardEvent } from 'react';
-import { FaTrashAlt, FaEye, FaEyeSlash } from 'react-icons/fa';
-import { openConfirm } from './ConfirmModal';
+import { FaTrashAlt, FaEye, FaEyeSlash, FaExpand, FaUndoAlt, FaRedoAlt, FaCheckCircle, FaCut, FaObjectGroup } from 'react-icons/fa';
 import classNames from 'classnames';
 import { apiClient } from '@/utils/api';
 import AudioPlayer from './AudioPlayer';
+import VideoTrimModal from './VideoTrimModal';
 import { isVideo, isAudio } from '@/utils/basic';
 
 interface DatasetImageCardProps {
@@ -12,6 +12,14 @@ interface DatasetImageCardProps {
   children?: ReactNode;
   className?: string;
   onDelete?: () => void;
+  onSplit?: () => void;
+  onTrim?: () => void;
+  onMerge?: () => void;
+  onEnlarge?: () => void;
+  selected?: boolean;
+  isSelectMode?: boolean;
+  onLongPress?: () => void;
+  onSelect?: () => void;
 }
 
 const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
@@ -20,6 +28,14 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   children,
   className = '',
   onDelete = () => {},
+  onSplit,
+  onTrim,
+  onMerge,
+  onEnlarge,
+  selected = false,
+  isSelectMode = false,
+  onLongPress,
+  onSelect,
 }) => {
   const cardRef = useRef<HTMLDivElement>(null);
   const [isVisible, setIsVisible] = useState<boolean>(false);
@@ -28,7 +44,20 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   const [isCaptionLoaded, setIsCaptionLoaded] = useState<boolean>(false);
   const [caption, setCaption] = useState<string>('');
   const [savedCaption, setSavedCaption] = useState<string>('');
+  const [imageKey, setImageKey] = useState<number>(Date.now());
+  const [videoKey, setVideoKey] = useState<number>(Date.now());
+  const [isVideoEditOpen, setIsVideoEditOpen] = useState<boolean>(false);
   const isGettingCaption = useRef<boolean>(false);
+  const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const didLongPress = useRef<boolean>(false);
+
+  useEffect(() => {
+    return () => {
+      if (longPressTimer.current) {
+        clearTimeout(longPressTimer.current);
+      }
+    };
+  }, []);
 
   const fetchCaption = async () => {
     if (isGettingCaption.current || isCaptionLoaded) return;
@@ -67,6 +96,22 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
       .catch(error => {
         console.error('Error saving caption:', error);
       });
+  };
+
+  const rotateImage = (direction: 'left' | 'right') => {
+    apiClient
+      .post('/api/img/rotate', { imgPath: imageUrl, direction })
+      .then(() => {
+        setLoaded(false);
+        setImageKey(prev => prev + 1);
+      })
+      .catch(error => {
+        console.error('Error rotating image:', error);
+      });
+  };
+
+  const handleVideoEdit = () => {
+    setIsVideoEditOpen(true);
   };
 
   // Only fetch caption when the component is both in viewport and visible
@@ -121,6 +166,39 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
     }
   };
 
+  const handlePointerDown = () => {
+    didLongPress.current = false;
+    longPressTimer.current = setTimeout(() => {
+      didLongPress.current = true;
+      onLongPress?.();
+    }, 500);
+  };
+
+  const clearLongPress = () => {
+    if (longPressTimer.current) {
+      clearTimeout(longPressTimer.current);
+      longPressTimer.current = null;
+    }
+  };
+
+  const handlePointerUp = () => clearLongPress();
+  const handlePointerLeave = () => clearLongPress();
+  const handlePointerCancel = () => clearLongPress();
+
+  const handleCardClick = (e: React.MouseEvent) => {
+    if (didLongPress.current) {
+      e.preventDefault();
+      e.stopPropagation();
+      didLongPress.current = false;
+      return;
+    }
+    if (isSelectMode) {
+      e.preventDefault();
+      e.stopPropagation();
+      onSelect?.();
+    }
+  };
+
   const isCaptionCurrent = caption.trim() === savedCaption;
 
   const isItAVideo = isVideo(imageUrl);
@@ -128,7 +206,17 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   const isItImage = !isItAVideo && !isItAudio;
 
   return (
-    <div className={`flex flex-col ${className}`}>
+    <div
+      className={classNames(`flex flex-col ${className}`, {
+        'ring-2 ring-blue-500 rounded-lg': selected,
+      })}
+      onPointerDown={handlePointerDown}
+      onPointerUp={handlePointerUp}
+      onPointerLeave={handlePointerLeave}
+      onPointerCancel={handlePointerCancel}
+      onContextMenu={e => e.preventDefault()}
+      onClick={handleCardClick}
+    >
       {/* Square image container */}
       <div
         ref={cardRef}
@@ -140,11 +228,11 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
             <>
               {isItAVideo && (
                 <video
-                  src={`/api/img/${encodeURIComponent(imageUrl)}`}
+                  key={videoKey}
+                  src={`/api/img/${encodeURIComponent(imageUrl)}?v=${videoKey}`}
                   className={`w-full h-full object-contain`}
                   autoPlay={false}
                   loop
-                  muted
                   controls
                 />
               )}
@@ -156,12 +244,14 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
               )}
               {isItImage && (
                 <img
-                  src={`/api/img/${encodeURIComponent(imageUrl)}`}
+                  key={imageKey}
+                  src={`/api/img/${encodeURIComponent(imageUrl)}?v=${imageKey}`}
                   alt={alt}
                   onLoad={handleLoad}
+                  onClick={isSelectMode ? undefined : onEnlarge}
                   className={`w-full h-full object-contain transition-opacity duration-300 ${
                     loaded ? 'opacity-100' : 'opacity-0'
-                  }`}
+                  } ${onEnlarge && !isSelectMode ? 'cursor-pointer' : ''}`}
                 />
               )}
             </>
@@ -172,32 +262,84 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
             </div>
           )}
           {children && <div className="absolute inset-0 flex items-center justify-center">{children}</div>}
+          {/* Selection overlay */}
+          {isSelectMode && (
+            <div
+              className={classNames(
+                'absolute inset-0 rounded-t-lg transition-colors duration-150 flex items-start justify-start p-2',
+                selected ? 'bg-blue-500/30' : 'bg-transparent',
+              )}
+            >
+              <FaCheckCircle
+                className={classNames('w-6 h-6 transition-colors duration-150', selected ? 'text-blue-400' : 'text-gray-500')}
+              />
+            </div>
+          )}
+          {!isSelectMode && (
           <div className="absolute top-1 right-1 flex space-x-2 z-10">
+            {onEnlarge && isItImage && (
+              <button
+                className="bg-gray-800 rounded-full p-2"
+                onClick={onEnlarge}
+                aria-label="Enlarge image"
+              >
+                <FaExpand />
+              </button>
+            )}
+            {isItImage && (
+              <button
+                className="bg-gray-800 rounded-full p-2"
+                onClick={() => rotateImage('left')}
+                aria-label="Rotate image left"
+              >
+                <FaUndoAlt />
+              </button>
+            )}
+            {isItImage && (
+              <button
+                className="bg-gray-800 rounded-full p-2"
+                onClick={() => rotateImage('right')}
+                aria-label="Rotate image right"
+              >
+                <FaRedoAlt />
+              </button>
+            )}
+            {isItAVideo && (
+              <button
+                className="bg-gray-800 rounded-full p-2"
+                onClick={handleVideoEdit}
+                aria-label="Edit video (trim or split)"
+              >
+                <FaCut />
+              </button>
+            )}
+            {isItAVideo && onMerge && (
+              <button
+                className="bg-gray-800 rounded-full p-2"
+                onClick={onMerge}
+                aria-label="Merge video clips"
+              >
+                <FaObjectGroup />
+              </button>
+            )}
             <button
               className="bg-gray-800 rounded-full p-2"
               onClick={() => {
-                openConfirm({
-                  title: `Delete ${isItAVideo ? 'video' : 'image'}`,
-                  message: `Are you sure you want to delete this ${isItAVideo ? 'video' : 'image'}? This action cannot be undone.`,
-                  type: 'warning',
-                  confirmText: 'Delete',
-                  onConfirm: () => {
                     apiClient
-                      .post('/api/img/delete', { imgPath: imageUrl })
+                      .post('/api/img/trash', { imgPath: imageUrl })
                       .then(() => {
-                        console.log('Image deleted:', imageUrl);
+                        console.log('Image moved to trash:', imageUrl);
                         onDelete();
                       })
                       .catch(error => {
-                        console.error('Error deleting image:', error);
+                        console.error('Error moving image to trash:', error);
                       });
-                  },
-                });
-              }}
+                  }}
             >
               <FaTrashAlt />
             </button>
           </div>
+          )}
         </div>
         {inViewport && isVisible && !isItAudio && (
           <div className="text-xs text-gray-100 bg-gray-950 mt-1 absolute bottom-0 left-0 p-1 opacity-25 hover:opacity-90 transition-opacity duration-300 w-full">
@@ -237,6 +379,15 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
           <div className="w-full h-full flex items-center justify-center text-gray-400">Loading caption...</div>
         )}
       </div>
+      {isItAVideo && (
+        <VideoTrimModal
+          videoUrl={imageUrl}
+          isOpen={isVideoEditOpen}
+          onClose={() => setIsVideoEditOpen(false)}
+          onTrim={() => { setIsVideoEditOpen(false); setVideoKey(Date.now()); onTrim?.(); }}
+          onSplit={() => { setIsVideoEditOpen(false); onSplit?.(); }}
+        />
+      )}
     </div>
   );
 };

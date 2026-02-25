@@ -1,13 +1,15 @@
 'use client';
 
-import { useEffect, useState, use, useMemo } from 'react';
+import { useEffect, useState, use, useMemo, useCallback } from 'react';
 import { LuImageOff, LuLoader, LuBan } from 'react-icons/lu';
-import { FaChevronLeft } from 'react-icons/fa';
+import { FaChevronLeft, FaTrashAlt, FaTimes, FaObjectGroup } from 'react-icons/fa';
 import DatasetImageCard from '@/components/DatasetImageCard';
+import DatasetImageViewer from '@/components/DatasetImageViewer';
 import { Button } from '@headlessui/react';
 import AddImagesModal, { openImagesModal } from '@/components/AddImagesModal';
 import { TopBar, MainContent } from '@/components/layout';
 import { apiClient } from '@/utils/api';
+import { isAudio, isVideo } from '@/utils/basic';
 import FullscreenDropOverlay from '@/components/FullscreenDropOverlay';
 
 export default function DatasetPage({ params }: { params: { datasetName: string } }) {
@@ -15,6 +17,14 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
   const usableParams = use(params as any) as { datasetName: string };
   const datasetName = usableParams.datasetName;
   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
+  const [selectedImage, setSelectedImage] = useState<string | null>(null);
+  const [isSelectMode, setIsSelectMode] = useState<boolean>(false);
+  const [isMergeMode, setIsMergeMode] = useState<boolean>(false);
+  const [selectedImages, setSelectedImages] = useState<Set<string>>(new Set());
+
+  const removeImageFromList = useCallback((imgPath: string) => {
+    setImgList(prev => prev.filter(x => x.img_path !== imgPath));
+  }, []);
 
   const refreshImageList = (dbName: string) => {
     setStatus('loading');
@@ -39,6 +49,70 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
       refreshImageList(datasetName);
     }
   }, [datasetName]);
+
+  const handleLongPress = useCallback((imgPath: string) => {
+    setIsSelectMode(true);
+    setSelectedImages(new Set([imgPath]));
+  }, []);
+
+  const handleSelect = useCallback((imgPath: string) => {
+    setSelectedImages(prev => {
+      const next = new Set(prev);
+      if (next.has(imgPath)) {
+        next.delete(imgPath);
+      } else {
+        next.add(imgPath);
+      }
+      return next;
+    });
+  }, []);
+
+  const handleCancelSelect = useCallback(() => {
+    setIsSelectMode(false);
+    setIsMergeMode(false);
+    setSelectedImages(new Set());
+  }, []);
+
+  useEffect(() => {
+    if (isSelectMode && selectedImages.size === 0) {
+      setIsSelectMode(false);
+      setIsMergeMode(false);
+    }
+  }, [isSelectMode, selectedImages.size]);
+
+  const handleBulkDelete = useCallback(async () => {
+    const paths = Array.from(selectedImages);
+    await Promise.all(
+      paths.map(imgPath =>
+        apiClient
+          .post('/api/img/trash', { imgPath })
+          .then(() => removeImageFromList(imgPath))
+          .catch(error => console.error('Error moving image to trash:', error)),
+      ),
+    );
+    setIsSelectMode(false);
+    setSelectedImages(new Set());
+  }, [selectedImages, removeImageFromList]);
+
+  const handleMergeStart = useCallback((imgPath: string) => {
+    setIsSelectMode(true);
+    setIsMergeMode(true);
+    setSelectedImages(new Set([imgPath]));
+  }, []);
+
+  const handleMergeClips = useCallback(async () => {
+    const videoPaths = Array.from(selectedImages).filter(p => isVideo(p)).sort();
+    if (videoPaths.length < 2) return;
+    try {
+      await apiClient.post('/api/video/merge', { videoPaths });
+      refreshImageList(datasetName);
+    } catch (error) {
+      console.error('Error merging videos:', error);
+    }
+    setIsSelectMode(false);
+    setIsMergeMode(false);
+    setSelectedImages(new Set());
+  }, [selectedImages, datasetName]);
 
   const PageInfoContent = useMemo(() => {
     let icon = null;
@@ -94,25 +168,69 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
     <>
       {/* Fixed top bar */}
       <TopBar>
-        <div>
-          <Button className="text-gray-500 dark:text-gray-300 px-3 mt-1" onClick={() => history.back()}>
-            <FaChevronLeft />
-          </Button>
-        </div>
-        <div>
-          <h1 className="text-lg">Dataset: {datasetName}</h1>
-        </div>
-        <div className="flex-1"></div>
-        <div>
-          <Button
-            className="text-gray-200 bg-slate-600 px-3 py-1 rounded-md"
-            onClick={() => openImagesModal(datasetName, () => refreshImageList(datasetName))}
-          >
-            Add Images
-          </Button>
-        </div>
+        {isSelectMode ? (
+          <>
+            <div>
+              <Button className="text-gray-500 dark:text-gray-300 px-3 mt-1" onClick={handleCancelSelect}>
+                <FaTimes />
+              </Button>
+            </div>
+            <div>
+              <h1 className="text-lg">{selectedImages.size} {isMergeMode ? 'clip' : 'image'}{selectedImages.size !== 1 ? 's' : ''} selected</h1>
+            </div>
+            <div className="flex-1"></div>
+            <div>
+              {isMergeMode ? (
+                <Button
+                  className="text-gray-200 bg-blue-700 px-3 py-1 rounded-md flex items-center gap-2 disabled:opacity-50"
+                  onClick={handleMergeClips}
+                  disabled={Array.from(selectedImages).filter(p => isVideo(p)).length < 2}
+                >
+                  <FaObjectGroup />
+                  Merge Clips
+                </Button>
+              ) : (
+                <Button
+                  className="text-gray-200 bg-red-700 px-3 py-1 rounded-md flex items-center gap-2 disabled:opacity-50"
+                  onClick={handleBulkDelete}
+                  disabled={selectedImages.size === 0}
+                >
+                  <FaTrashAlt />
+                  Delete Selected
+                </Button>
+              )}
+            </div>
+          </>
+        ) : (
+          <>
+            <div>
+              <Button className="text-gray-500 dark:text-gray-300 px-3 mt-1" onClick={() => history.back()}>
+                <FaChevronLeft />
+              </Button>
+            </div>
+            <div>
+              <h1 className="text-lg">Dataset: {datasetName}, Images: {imgList.length}</h1>
+            </div>
+            <div className="flex-1"></div>
+            <div>
+              <Button
+                className="text-gray-200 bg-slate-600 px-3 py-1 rounded-md"
+                onClick={() => openImagesModal(datasetName, () => refreshImageList(datasetName))}
+              >
+                Add Images
+              </Button>
+            </div>
+          </>
+        )}
       </TopBar>
       <MainContent>
+        {isSelectMode && (
+          <p className="text-xs text-gray-400 mb-3">
+            {isMergeMode
+              ? 'Click video clips to select them for merging. Press Cancel to exit.'
+              : 'Click images to select or deselect. Press Cancel to exit select mode.'}
+          </p>
+        )}
         {PageInfoContent}
         {status === 'success' && imgList.length > 0 && (
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
@@ -121,13 +239,25 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
                 key={img.img_path}
                 alt="image"
                 imageUrl={img.img_path}
-                onDelete={() => refreshImageList(datasetName)}
+                onDelete={() => removeImageFromList(img.img_path)}
+                onSplit={() => refreshImageList(datasetName)}
+                onMerge={() => handleMergeStart(img.img_path)}
+                onEnlarge={() => setSelectedImage(img.img_path)}
+                isSelectMode={isSelectMode}
+                selected={selectedImages.has(img.img_path)}
+                onLongPress={() => handleLongPress(img.img_path)}
+                onSelect={() => handleSelect(img.img_path)}
               />
             ))}
           </div>
         )}
       </MainContent>
       <AddImagesModal />
+      <DatasetImageViewer
+        imgPath={selectedImage}
+        images={imgList.map(img => img.img_path).filter(path => !isAudio(path))}
+        onChange={setSelectedImage}
+      />
       <FullscreenDropOverlay
         datasetName={datasetName}
         onComplete={() => refreshImageList(datasetName)}
