@@ -120,7 +120,9 @@ class ExtractableModuleMixin:
             extract_mode = 'fixed'
             extract_mode_param = self.lora_dim
             
-        if isinstance(weight_to_extract, QBytesTensor):
+        if isinstance(weight_to_extract, QBytesTensor) or isinstance(weight_to_extract, QTensor):
+            weight_to_extract = weight_to_extract.dequantize()
+        elif type(weight_to_extract).__name__ == 'AffineQuantizedTensor':
             weight_to_extract = weight_to_extract.dequantize()
         
         weight_to_extract = weight_to_extract.clone().detach().float()
@@ -225,7 +227,7 @@ class ToolkitModuleMixin:
     def lorm_forward(self: Network, x, *args, **kwargs):
         network: Network = self.network_ref()
         if not network.is_active:
-            return self.org_forward(x, *args, **kwargs)
+            return self._org_forward_safe(x, *args, **kwargs)
         
         orig_dtype = x.dtype
         
@@ -237,7 +239,7 @@ class ToolkitModuleMixin:
             inputs = x.detach()
             with torch.no_grad():
                 # get the local prediction
-                target_pred = self.org_forward(inputs, *args, **kwargs).detach()
+                target_pred = self._org_forward_safe(inputs, *args, **kwargs).detach()
             with torch.set_grad_enabled(True):
                 # make a prediction with the lorm
                 lorm_pred = self.lora_up(self.lora_down(inputs.requires_grad_(True)))
@@ -254,6 +256,33 @@ class ToolkitModuleMixin:
             x = self.lora_up(self.lora_down(x))
             if x.dtype != orig_dtype:
                 x = x.to(orig_dtype)
+
+    def _get_org_compute_dtype(self: Module):
+        _w = self.org_module[0].weight
+        _w_is_quant = (
+            isinstance(_w, (QTensor, QBytesTensor))
+            or type(_w).__name__ == 'AffineQuantizedTensor'
+            or getattr(_w, 'is_quantized', False)
+        )
+        if _w_is_quant:
+            _b = getattr(self.org_module[0], 'bias', None)
+            if _b is not None and isinstance(_b, torch.Tensor) and _b.dtype.is_floating_point:
+                return _b.dtype
+            return torch.bfloat16
+        elif _w.dtype.is_floating_point:
+            return _w.dtype
+        return torch.bfloat16
+
+    def _org_forward_safe(self: Module, x, *args, **kwargs):
+        orig_dtype = x.dtype
+        compute_dtype = self._get_org_compute_dtype()
+        x_in = x.to(compute_dtype) if x.dtype != compute_dtype else x
+        out = self.org_forward(x_in, *args, **kwargs)
+        if getattr(out, 'is_quantized', False) or type(out).__name__ in ('AffineQuantizedTensor', 'QTensor', 'QBytesTensor'):
+            out = out.dequantize().detach().requires_grad_(x.requires_grad)
+        if out.dtype != orig_dtype:
+            out = out.to(orig_dtype)
+        return out
 
     def forward(self: Module, x, *args, **kwargs):
         skip = False
@@ -276,7 +305,7 @@ class ToolkitModuleMixin:
 
         if skip:
             # network is not active, avoid doing anything
-            return self.org_forward(x, *args, **kwargs)
+            return self._org_forward_safe(x, *args, **kwargs)
 
         # if self.__class__.__name__ == "DoRAModule":
         #     # return dora forward
@@ -285,9 +314,11 @@ class ToolkitModuleMixin:
         if self.__class__.__name__ == "LokrModule":
             return self._call_forward(x)
 
-        org_forwarded = self.org_forward(x, *args, **kwargs)
+        org_forwarded = self._org_forward_safe(x, *args, **kwargs)
 
-        if isinstance(x, QTensor):
+        if isinstance(x, QTensor) or isinstance(x, QBytesTensor):
+            x = x.dequantize()
+        elif type(x).__name__ == 'AffineQuantizedTensor':
             x = x.dequantize()
         # always cast to float32
         lora_input = x.to(self.lora_down.weight.dtype)

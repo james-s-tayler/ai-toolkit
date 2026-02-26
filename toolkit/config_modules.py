@@ -182,6 +182,8 @@ class NetworkConfig:
         self.linear_alpha: float = kwargs.get('linear_alpha', self.alpha)
         self.conv_alpha: float = kwargs.get('conv_alpha', self.conv)
         self.dropout: Union[float, None] = kwargs.get('dropout', None)
+        self.rank_dropout: Union[float, None] = kwargs.get('rank_dropout', None)
+        self.module_dropout: Union[float, None] = kwargs.get('module_dropout', None)
         self.network_kwargs: dict = kwargs.get('network_kwargs', {})
 
         self.lorm_config: Union[LoRMConfig, None] = None
@@ -491,6 +493,18 @@ class TrainConfig:
         self.correct_pred_norm_multiplier = kwargs.get('correct_pred_norm_multiplier', 1.0)
 
         self.loss_type = kwargs.get('loss_type', 'mse') # mse, mae, wavelet, pixelspace, mean_flow
+        # scales audio loss when training joint audio-video models (e.g. LTX-2)
+        self.audio_loss_multiplier = kwargs.get('audio_loss_multiplier', 1.0)
+        # dynamically balance audio loss to match video loss contribution
+        self.auto_balance_audio_loss = kwargs.get('auto_balance_audio_loss', False)
+        # strict audio mode fails early when expected audio supervision is frequently missing
+        self.strict_audio_mode = kwargs.get('strict_audio_mode', False)
+        self.strict_audio_min_supervised_ratio = kwargs.get('strict_audio_min_supervised_ratio', 0.9)
+        self.strict_audio_warmup_steps = kwargs.get('strict_audio_warmup_steps', 50)
+        self.strict_audio_min_supervised_ratio = max(0.0, min(1.0, float(self.strict_audio_min_supervised_ratio)))
+        self.strict_audio_warmup_steps = max(0, int(self.strict_audio_warmup_steps))
+        # sample an independent random timestep for audio instead of sharing the video timestep
+        self.independent_audio_timestep = kwargs.get('independent_audio_timestep', True)
 
         # scale the prediction by this. Increase for more detail, decrease for less
         self.pred_scaler = kwargs.get('pred_scaler', 1.0)
@@ -658,9 +672,6 @@ class ModelConfig:
         if self.layer_offloading and self.qtype_te == "qfloat8":
             self.qtype_te = "float8"
         
-        # verbose logging flag for detailed output
-        self.verbose = kwargs.get("verbose", False)
-        
         # 0 is off and 1.0 is 100% of the layers
         self.layer_offloading_transformer_percent = kwargs.get("layer_offloading_transformer_percent", 1.0)
         self.layer_offloading_text_encoder_percent = kwargs.get("layer_offloading_text_encoder_percent", 1.0)
@@ -685,8 +696,6 @@ class ModelConfig:
         
         # model paths for models that support it
         self.model_paths = kwargs.get("model_paths", {})
-        
-        self.audio_loss_multiplier = kwargs.get("audio_loss_multiplier", 1.0)
         
         # allow frontend to pass arch with a color like arch:tag
         # but remove the tag
@@ -988,7 +997,10 @@ class DatasetConfig:
         self.fast_image_size: bool = kwargs.get('fast_image_size', False)
         
         self.do_i2v: bool = kwargs.get('do_i2v', True)  # do image to video on models that are both t2i and i2v capable
-        self.do_audio: bool = kwargs.get('do_audio', False) # load audio from video files for models that support it
+        # For video datasets, default to loading audio unless explicitly disabled.
+        # This avoids silently training video-only when users provide clips that already contain sound.
+        default_do_audio = kwargs.get("num_frames", 1) > 1
+        self.do_audio: bool = kwargs.get('do_audio', default_do_audio) # load audio from video files for models that support it
         self.audio_preserve_pitch: bool = kwargs.get('audio_preserve_pitch', False) # preserve pitch when stretching audio to fit num_frames
         self.audio_normalize: bool = kwargs.get('audio_normalize', False) # normalize audio volume levels when loading
 

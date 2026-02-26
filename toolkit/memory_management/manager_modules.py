@@ -151,8 +151,9 @@ class _BouncingLinearFn(torch.autograd.Function):
                 if w_fp_gpu.dtype != target_dtype:
                     w_fp_gpu = w_fp_gpu.to(target_dtype, non_blocking=True)
                 return w_fp_gpu
-            # float path (preserve original behavior: NO dtype cast)
             w_gpu = cpu_w.to(dev, non_blocking=True)
+            if w_gpu.dtype != target_dtype:
+                w_gpu = w_gpu.to(target_dtype, non_blocking=True)
             return w_gpu
 
         if device.type != "cuda":
@@ -183,7 +184,13 @@ class _BouncingLinearFn(torch.autograd.Function):
 
         torch.cuda.current_stream().wait_event(ev_tx_f)
         ev_cu_s.record()
-        out = F.linear(x, w_bufs[idx], b_bufs[idx])
+        w = w_bufs[idx]
+        if w.dtype != x.dtype:
+            w = w.to(x.dtype)
+        b = b_bufs[idx]
+        if b is not None and b.dtype != x.dtype:
+            b = b.to(x.dtype)
+        out = F.linear(x, w, b)
 
         ctx.save_for_backward(x, weight_cpu, bias_cpu)
         ctx.device = device
@@ -250,8 +257,9 @@ class _BouncingLinearFn(torch.autograd.Function):
                 if w_fp_gpu.dtype != target_dtype:
                     w_fp_gpu = w_fp_gpu.to(target_dtype, non_blocking=True)
                 return w_fp_gpu
-            # float path (preserve original behavior: NO dtype cast)
             w = cpu_w.to(device, non_blocking=True)
+            if w.dtype != target_dtype:
+                w = w.to(target_dtype, non_blocking=True)
             return w
 
         with torch.cuda.stream(transfer_stream):
@@ -264,7 +272,10 @@ class _BouncingLinearFn(torch.autograd.Function):
         ev_cu_b_start.record()
 
         # grad wrt input (GPU)
-        grad_input = grad_out.to(dtype=target_dtype) @ w_bwd_buffers[idx]
+        w_bwd = w_bwd_buffers[idx]
+        if w_bwd.dtype != target_dtype:
+            w_bwd = w_bwd.to(target_dtype)
+        grad_input = grad_out.to(dtype=target_dtype) @ w_bwd
 
         # ensure previous grad-to-CPU transfer that used this slot finished
         torch.cuda.current_stream().wait_event(ev_tx_w_bwd_done)
@@ -327,8 +338,9 @@ class _BouncingConv2dFn(torch.autograd.Function):
                 if w_fp_gpu.dtype != target_dtype:
                     w_fp_gpu = w_fp_gpu.to(target_dtype, non_blocking=True)
                 return w_fp_gpu
-            # float path (preserve original behavior: NO dtype cast)
             w_gpu = cpu_w.to(dev, non_blocking=True)
+            if w_gpu.dtype != target_dtype:
+                w_gpu = w_gpu.to(target_dtype, non_blocking=True)
             return w_gpu
 
         if device.type != "cuda":
@@ -363,7 +375,13 @@ class _BouncingConv2dFn(torch.autograd.Function):
 
         torch.cuda.current_stream().wait_event(ev_tx_f)
         ev_cu_s.record()
-        out = F.conv2d(x, w_bufs[idx], b_bufs[idx], stride, padding, dilation, groups)
+        w = w_bufs[idx]
+        if w.dtype != x.dtype:
+            w = w.to(x.dtype)
+        b = b_bufs[idx]
+        if b is not None and b.dtype != x.dtype:
+            b = b.to(x.dtype)
+        out = F.conv2d(x, w, b, stride, padding, dilation, groups)
 
         ctx.save_for_backward(x, weight_cpu, bias_cpu)
         ctx.meta = (device, stride, padding, dilation, groups, target_dtype)
@@ -457,8 +475,9 @@ class _BouncingConv2dFn(torch.autograd.Function):
                 if w_fp_gpu.dtype != target_dtype:
                     w_fp_gpu = w_fp_gpu.to(target_dtype, non_blocking=True)
                 return w_fp_gpu
-            # float path (preserve original behavior: NO dtype cast)
             w = cpu_w.to(device, non_blocking=True)
+            if w.dtype != target_dtype:
+                w = w.to(target_dtype, non_blocking=True)
             return w
 
         # Stage weights for input-grad compute
@@ -473,9 +492,12 @@ class _BouncingConv2dFn(torch.autograd.Function):
 
         from torch.nn.grad import conv2d_input, conv2d_weight  # type: ignore
 
+        w_bwd = w_bwd_buffers[idx]
+        if w_bwd.dtype != target_dtype:
+            w_bwd = w_bwd.to(target_dtype)
         grad_input = conv2d_input(
             x.shape,
-            w_bwd_buffers[idx],
+            w_bwd,
             grad_out.to(dtype=target_dtype),
             stride=stride,
             padding=padding,

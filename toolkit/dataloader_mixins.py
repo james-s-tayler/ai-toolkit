@@ -35,6 +35,109 @@ from torchvision.transforms import functional as TF
 
 from toolkit.train_tools import get_torch_dtype
 
+
+def _load_audio_robust(path: str):
+    """Load audio from any media file. Returns (waveform: Tensor[C,L], sample_rate: int).
+    
+    Strategy:
+      1. Try torchaudio.load() (works when torchcodec/ffmpeg backend is healthy)
+      2. Fall back to PyAV (av package, already in requirements.txt — ships its own ffmpeg libs)
+      3. Fall back to ffmpeg CLI subprocess as last resort
+    """
+    # --- Attempt 1: torchaudio ---
+    try:
+        import torchaudio
+        waveform, sr = torchaudio.load(path)
+        return waveform, sr
+    except Exception:
+        pass
+
+    # --- Attempt 2: PyAV (ships bundled ffmpeg libraries, no system ffmpeg needed) ---
+    try:
+        import av
+        container = av.open(path)
+        audio_stream = next((s for s in container.streams if s.type == 'audio'), None)
+        if audio_stream is None:
+            raise RuntimeError(f"No audio stream found in {path}")
+
+        sr = audio_stream.rate or 44100
+        frames_data = []
+        for frame in container.decode(audio=0):
+            arr = frame.to_ndarray()  # [channels, samples] or [samples] for mono
+            if arr.ndim == 1:
+                arr = arr[np.newaxis, :]
+            frames_data.append(arr)
+        container.close()
+
+        if len(frames_data) == 0:
+            raise RuntimeError(f"No audio frames decoded from {path}")
+
+        audio_np = np.concatenate(frames_data, axis=1)  # [channels, total_samples]
+        if audio_np.dtype == np.int16:
+            audio_np = audio_np.astype(np.float32) / 32768.0
+        elif audio_np.dtype == np.int32:
+            audio_np = audio_np.astype(np.float32) / 2147483648.0
+        elif audio_np.dtype != np.float32:
+            audio_np = audio_np.astype(np.float32)
+
+        waveform = torch.from_numpy(audio_np.copy())
+        return waveform, int(sr)
+    except Exception as e:
+        _pyav_err = str(e)
+
+    # --- Attempt 3: ffmpeg CLI subprocess + wave module ---
+    import subprocess, tempfile, wave as _wave_mod, shutil
+
+    _ffmpeg_bin = shutil.which('ffmpeg')
+    if _ffmpeg_bin is None:
+        _candidates = [
+            r'C:\pinokio\api\ai-toolkit.git\app\env\Library\bin\ffmpeg.exe',
+            r'C:\pinokio\bin\miniconda\Library\bin\ffmpeg.exe',
+            r'C:\ffmpeg\bin\ffmpeg.exe',
+        ]
+        for c in _candidates:
+            if os.path.isfile(c):
+                _ffmpeg_bin = c
+                break
+
+    if _ffmpeg_bin is None:
+        raise RuntimeError(
+            f"Cannot extract audio from {path}. All methods failed:\n"
+            f"  torchaudio: torchcodec/ffmpeg DLLs missing\n"
+            f"  PyAV: {_pyav_err}\n"
+            f"  ffmpeg CLI: not found in PATH\n"
+            f"Install ffmpeg or fix PyAV: pip install av"
+        )
+
+    _tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+    _tmp.close()
+    try:
+        result = subprocess.run(
+            [_ffmpeg_bin, '-y', '-i', path, '-vn', '-acodec', 'pcm_s16le',
+             '-ar', '44100', '-ac', '2', _tmp.name],
+            capture_output=True, timeout=120
+        )
+        if result.returncode != 0:
+            stderr_msg = result.stderr.decode('utf-8', errors='replace')[-500:]
+            raise RuntimeError(f"ffmpeg failed (rc={result.returncode}): {stderr_msg}")
+
+        with _wave_mod.open(_tmp.name, 'rb') as wf:
+            n_channels = wf.getnchannels()
+            sr = wf.getframerate()
+            n_frames = wf.getnframes()
+            raw_bytes = wf.readframes(n_frames)
+
+        samples = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        samples = samples.reshape(-1, n_channels).T  # [channels, samples]
+        waveform = torch.from_numpy(samples.copy())
+        return waveform, sr
+    finally:
+        try:
+            os.remove(_tmp.name)
+        except OSError:
+            pass
+
+
 if TYPE_CHECKING:
     from toolkit.data_loader import AiToolkitDataset
     from toolkit.data_transfer_object.data_loader import FileItemDTO
@@ -607,7 +710,6 @@ class ImageProcessingDTOMixin:
                 self.audio_tensor = None
 
                 try:
-                    import torchaudio
                     import torch.nn.functional as F
 
                     # Compute the time range of the selected frames in the *source* video
@@ -630,7 +732,7 @@ class ImageProcessingDTOMixin:
                     else:
                         target_duration = source_duration
 
-                    waveform, sample_rate = torchaudio.load(self.path)  # [channels, samples]
+                    waveform, sample_rate = _load_audio_robust(self.path)
                     
                     if self.dataset_config.audio_normalize:
                         peak = waveform.abs().amax()  # global peak across channels
@@ -670,9 +772,7 @@ class ImageProcessingDTOMixin:
                         self.audio_data = {"waveform": waveform, "sample_rate": int(sample_rate)}
 
                 except Exception as e:
-                    # Keep behavior identical for non-audio datasets; for audio datasets, just skip if missing/broken.
-                    if hasattr(self.dataset_config, 'debug') and self.dataset_config.debug:
-                        print_acc(f"Could not extract/stretch audio for {self.path}: {e}")
+                    print_acc(f"WARNING: Audio extraction failed for {self.path}: {e}")
                     self.audio_data = None
                     self.audio_tensor = None
             
@@ -1826,6 +1926,8 @@ class LatentCachingMixin:
 
             # use tqdm to show progress
             i = 0
+            _audio_encoded_count = 0
+            _audio_failed_count = 0
             for file_item in tqdm(self.file_list, desc=f'Caching latents{" to disk" if to_disk else ""}'):
                 file_item.is_caching_to_disk = to_disk
                 file_item.is_caching_to_memory = to_memory
@@ -1833,7 +1935,16 @@ class LatentCachingMixin:
 
                 latent_path = file_item.get_latent_path(recalculate=True)
                 # check if it is saved to disk already
-                if os.path.exists(latent_path):
+                _cache_valid = os.path.exists(latent_path)
+                if _cache_valid and getattr(file_item.dataset_config, 'do_audio', False):
+                    try:
+                        from safetensors import safe_open
+                        with safe_open(latent_path, framework="pt") as f:
+                            if 'audio_latent' not in f.keys():
+                                _cache_valid = False
+                    except Exception:
+                        _cache_valid = False
+                if _cache_valid:
                     if to_memory:
                         # load it into memory
                         state_dict = load_file(latent_path, device='cpu')
@@ -1879,6 +1990,9 @@ class LatentCachingMixin:
                         audio_latent = self.sd.encode_audio([file_item.audio_data]).squeeze(0)
                         if to_disk:
                             state_dict['audio_latent'] = audio_latent.clone().detach().cpu()
+                        _audio_encoded_count += 1
+                    elif getattr(file_item.dataset_config, 'do_audio', False):
+                        _audio_failed_count += 1
                     
                     # save_latent
                     if to_disk:
@@ -1902,6 +2016,9 @@ class LatentCachingMixin:
 
                 file_item.is_latent_cached = True
                 i += 1
+
+            if _audio_encoded_count > 0 or _audio_failed_count > 0:
+                print_acc(f"Audio latent caching: {_audio_encoded_count} encoded, {_audio_failed_count} failed (no audio extracted)")
 
             # restore device state
             self.sd.restore_device_state()
