@@ -1,16 +1,39 @@
 'use client';
 
-import { useEffect, useState, use, useMemo, useCallback } from 'react';
-import { LuImageOff, LuLoader, LuBan } from 'react-icons/lu';
+import { useEffect, useState, use, useMemo, useCallback, useRef } from 'react';
+import { LuImageOff, LuLoader, LuBan, LuFolderOpen } from 'react-icons/lu';
 import { FaChevronLeft, FaTrashAlt, FaTimes, FaObjectGroup } from 'react-icons/fa';
 import DatasetImageCard from '@/components/DatasetImageCard';
 import DatasetImageViewer from '@/components/DatasetImageViewer';
 import { Button } from '@headlessui/react';
 import AddImagesModal, { openImagesModal } from '@/components/AddImagesModal';
+import BulkCaptionModal from '@/components/BulkCaptionModal';
 import { TopBar, MainContent } from '@/components/layout';
 import { apiClient } from '@/utils/api';
-import { isAudio, isVideo } from '@/utils/basic';
+import { isAudio, isVideo, formatDuration } from '@/utils/basic';
 import FullscreenDropOverlay from '@/components/FullscreenDropOverlay';
+
+interface ImageMetadataEntry {
+  img_path: string;
+  duration?: number;
+  width?: number;
+  height?: number;
+  scores?: Record<string, number>;
+}
+
+interface ScoringStatus {
+  status: 'idle' | 'running' | 'completed' | 'cancelled' | 'error';
+  scored: number;
+  total: number;
+  error?: string;
+}
+
+interface CaptioningStatus {
+  status: 'idle' | 'running' | 'completed' | 'cancelled' | 'error';
+  captioned: number;
+  total: number;
+  error?: string;
+}
 
 export default function DatasetPage({ params }: { params: { datasetName: string } }) {
   const [imgList, setImgList] = useState<{ img_path: string }[]>([]);
@@ -21,9 +44,33 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
   const [isSelectMode, setIsSelectMode] = useState<boolean>(false);
   const [isMergeMode, setIsMergeMode] = useState<boolean>(false);
   const [selectedImages, setSelectedImages] = useState<Set<string>>(new Set());
-
+  const [scoringStatus, setScoringStatus] = useState<ScoringStatus | null>(null);
+  const [scoreRefreshKey, setScoreRefreshKey] = useState<number>(0);
+  const scoringPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [captioningStatus, setCaptioningStatus] = useState<CaptioningStatus | null>(null);
+  const [isBulkCaptionModalOpen, setIsBulkCaptionModalOpen] = useState(false);
+  const captioningPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const prevCaptionedCountRef = useRef<number>(0);
+  const [captionRefreshKey, setCaptionRefreshKey] = useState<number>(0);
+  const [totalVideoDuration, setTotalVideoDuration] = useState<number>(0);
+  const [sortBy, setSortBy] = useState<string>('filename');
+  const [imageMetadata, setImageMetadata] = useState<Record<string, ImageMetadataEntry>>({});
   const removeImageFromList = useCallback((imgPath: string) => {
     setImgList(prev => prev.filter(x => x.img_path !== imgPath));
+  }, []);
+
+  const refreshImageMetadata = useCallback((dbName: string) => {
+    apiClient
+      .get(`/api/datasets/imageMetadata?datasetName=${encodeURIComponent(dbName)}`)
+      .then(res => res.data)
+      .then((data: { images: ImageMetadataEntry[] }) => {
+        const map: Record<string, ImageMetadataEntry> = {};
+        for (const entry of data.images) {
+          map[entry.img_path] = entry;
+        }
+        setImageMetadata(map);
+      })
+      .catch(() => {});
   }, []);
 
   const refreshImageList = (dbName: string) => {
@@ -47,6 +94,12 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
   useEffect(() => {
     if (datasetName) {
       refreshImageList(datasetName);
+      apiClient
+        .get(`/api/datasets/imageStats?datasetName=${encodeURIComponent(datasetName)}`)
+        .then(res => res.data)
+        .then(data => setTotalVideoDuration(data.totalVideoDuration ?? 0))
+        .catch(() => {});
+      refreshImageMetadata(datasetName);
     }
   }, [datasetName]);
 
@@ -72,6 +125,70 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
     setIsMergeMode(false);
     setSelectedImages(new Set());
   }, []);
+
+  const sortOptions = useMemo(() => {
+    const options: { value: string; label: string }[] = [
+      { value: 'filename', label: 'Filename' },
+    ];
+    const hasVideos = imgList.some(img => isVideo(img.img_path));
+    const hasImages = imgList.some(img => !isVideo(img.img_path) && !isAudio(img.img_path));
+    if (hasVideos) {
+      options.push({ value: 'duration:asc', label: 'Duration (Lowest to Highest)' });
+      options.push({ value: 'duration:desc', label: 'Duration (Highest to Lowest)' });
+    }
+    if (hasImages) {
+      options.push({ value: 'resolution:asc', label: 'Resolution (Small to Large)' });
+      options.push({ value: 'resolution:desc', label: 'Resolution (Large to Small)' });
+      const metrics = new Set<string>();
+      for (const meta of Object.values(imageMetadata)) {
+        if (meta.scores) {
+          for (const key of Object.keys(meta.scores)) {
+            metrics.add(key);
+          }
+        }
+      }
+      for (const metric of Array.from(metrics).sort()) {
+        options.push({ value: `score:${metric}:asc`, label: `${metric} (Lowest to Highest)` });
+        options.push({ value: `score:${metric}:desc`, label: `${metric} (Highest to Lowest)` });
+      }
+    }
+    return options;
+  }, [imgList, imageMetadata]);
+
+  const sortedImgList = useMemo(() => {
+    const list = [...imgList];
+    if (sortBy === 'filename') {
+      return list.sort((a, b) => a.img_path.localeCompare(b.img_path));
+    }
+    const parts = sortBy.split(':');
+    const type = parts[0];
+    const dir = parts[parts.length - 1] as 'asc' | 'desc';
+    if (type === 'duration') {
+      return list.sort((a, b) => {
+        const dA = imageMetadata[a.img_path]?.duration ?? 0;
+        const dB = imageMetadata[b.img_path]?.duration ?? 0;
+        return dir === 'asc' ? dA - dB : dB - dA;
+      });
+    }
+    if (type === 'resolution') {
+      return list.sort((a, b) => {
+        const mA = imageMetadata[a.img_path];
+        const mB = imageMetadata[b.img_path];
+        const pA = (mA?.width ?? 0) * (mA?.height ?? 0);
+        const pB = (mB?.width ?? 0) * (mB?.height ?? 0);
+        return dir === 'asc' ? pA - pB : pB - pA;
+      });
+    }
+    if (type === 'score') {
+      const metric = parts.slice(1, -1).join(':');
+      return list.sort((a, b) => {
+        const sA = imageMetadata[a.img_path]?.scores?.[metric] ?? 0;
+        const sB = imageMetadata[b.img_path]?.scores?.[metric] ?? 0;
+        return dir === 'asc' ? sA - sB : sB - sA;
+      });
+    }
+    return list;
+  }, [imgList, sortBy, imageMetadata]);
 
   useEffect(() => {
     if (isSelectMode && selectedImages.size === 0) {
@@ -113,6 +230,131 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
     setIsMergeMode(false);
     setSelectedImages(new Set());
   }, [selectedImages, datasetName]);
+
+  const stopScoringPoll = useCallback(() => {
+    if (scoringPollRef.current) {
+      clearInterval(scoringPollRef.current);
+      scoringPollRef.current = null;
+    }
+  }, []);
+
+  const startScoringPoll = useCallback(() => {
+    stopScoringPoll();
+    scoringPollRef.current = setInterval(async () => {
+      try {
+        const res = await apiClient.get(`/api/datasets/scoreImages?datasetName=${encodeURIComponent(datasetName)}`);
+        const data: ScoringStatus = res.data;
+        setScoringStatus(data);
+        if (data.status !== 'running') {
+          stopScoringPoll();
+          if (data.status === 'completed') {
+            setScoreRefreshKey(k => k + 1);
+          }
+        }
+      } catch (error) {
+        console.error('Error polling scoring status:', error);
+        stopScoringPoll();
+      }
+    }, 1000);
+  }, [datasetName, stopScoringPoll]);
+
+  useEffect(() => {
+    return () => stopScoringPoll();
+  }, [stopScoringPoll]);
+
+  useEffect(() => {
+    if (scoreRefreshKey > 0 && datasetName) {
+      refreshImageMetadata(datasetName);
+    }
+  }, [scoreRefreshKey, datasetName, refreshImageMetadata]);
+
+  const handleScoreImages = useCallback(async () => {
+    try {
+      const res = await apiClient.post('/api/datasets/scoreImages', { datasetName });
+      const data: ScoringStatus = res.data;
+      setScoringStatus(data);
+      if (data.status === 'running') {
+        startScoringPoll();
+      }
+    } catch (error: any) {
+      console.error('Error starting scoring:', error);
+    }
+  }, [datasetName, startScoringPoll]);
+
+  const handleCancelScoring = useCallback(async () => {
+    try {
+      await apiClient.delete(`/api/datasets/scoreImages?datasetName=${encodeURIComponent(datasetName)}`);
+      setScoringStatus(null);
+      stopScoringPoll();
+    } catch (error) {
+      console.error('Error cancelling scoring:', error);
+    }
+  }, [datasetName, stopScoringPoll]);
+
+  const stopCaptioningPoll = useCallback(() => {
+    if (captioningPollRef.current) {
+      clearInterval(captioningPollRef.current);
+      captioningPollRef.current = null;
+    }
+  }, []);
+
+  const startCaptioningPoll = useCallback(() => {
+    stopCaptioningPoll();
+    prevCaptionedCountRef.current = 0;
+    captioningPollRef.current = setInterval(async () => {
+      try {
+        const res = await apiClient.get(`/api/datasets/captionImages?datasetName=${encodeURIComponent(datasetName)}`);
+        const data: CaptioningStatus = res.data;
+        setCaptioningStatus(data);
+        if (data.captioned > prevCaptionedCountRef.current) {
+          prevCaptionedCountRef.current = data.captioned;
+          setCaptionRefreshKey(k => k + 1);
+        }
+        if (data.status !== 'running') {
+          stopCaptioningPoll();
+        }
+      } catch (error) {
+        console.error('Error polling captioning status:', error);
+        stopCaptioningPoll();
+      }
+    }, 1000);
+  }, [datasetName, stopCaptioningPoll]);
+
+  useEffect(() => {
+    return () => stopCaptioningPoll();
+  }, [stopCaptioningPoll]);
+
+  const handleStartCaptioning = useCallback(
+    async (options: { modelId: string; triggerWord: string; systemPrompt: string }) => {
+      setIsBulkCaptionModalOpen(false);
+      try {
+        const res = await apiClient.post('/api/datasets/captionImages', {
+          datasetName,
+          triggerWord: options.triggerWord,
+          systemPrompt: options.systemPrompt,
+          modelId: options.modelId,
+        });
+        const data: CaptioningStatus = res.data;
+        setCaptioningStatus(data);
+        if (data.status === 'running') {
+          startCaptioningPoll();
+        }
+      } catch (error: any) {
+        console.error('Error starting captioning:', error);
+      }
+    },
+    [datasetName, startCaptioningPoll],
+  );
+
+  const handleCancelCaptioning = useCallback(async () => {
+    try {
+      await apiClient.delete(`/api/datasets/captionImages?datasetName=${encodeURIComponent(datasetName)}`);
+      setCaptioningStatus(null);
+      stopCaptioningPoll();
+    } catch (error) {
+      console.error('Error cancelling captioning:', error);
+    }
+  }, [datasetName, stopCaptioningPoll]);
 
   const PageInfoContent = useMemo(() => {
     let icon = null;
@@ -209,21 +451,93 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
               </Button>
             </div>
             <div>
-              <h1 className="text-lg">Dataset: {datasetName}, Images: {imgList.length}</h1>
+              <h1 className="text-lg">
+                Dataset: {datasetName}, Images: {imgList.filter(img => !isVideo(img.img_path) && !isAudio(img.img_path)).length}
+                {(() => {
+                  const videoCount = imgList.filter(img => isVideo(img.img_path)).length;
+                  if (videoCount === 0) return null;
+                  return `, Videos: ${videoCount} (${formatDuration(totalVideoDuration)})`;
+                })()}
+              </h1>
             </div>
             <div className="flex-1"></div>
-            <div>
+            <div className="flex gap-2">
+              {scoringStatus?.status === 'running' ? (
+                <Button
+                  className="text-gray-200 bg-red-700 px-3 py-1 rounded-md"
+                  onClick={handleCancelScoring}
+                >
+                  Cancel Scoring
+                </Button>
+              ) : (
+                <Button
+                  className="text-gray-200 bg-slate-600 px-3 py-1 rounded-md"
+                  onClick={handleScoreImages}
+                >
+                  Score Images
+                </Button>
+              )}
+              {captioningStatus?.status === 'running' ? (
+                <Button
+                  className="text-gray-200 bg-red-700 px-3 py-1 rounded-md"
+                  onClick={handleCancelCaptioning}
+                >
+                  Cancel Captioning
+                </Button>
+              ) : (
+                <Button
+                  className="text-gray-200 bg-slate-600 px-3 py-1 rounded-md"
+                  onClick={() => setIsBulkCaptionModalOpen(true)}
+                >
+                  Caption Images
+                </Button>
+              )}
               <Button
                 className="text-gray-200 bg-slate-600 px-3 py-1 rounded-md"
                 onClick={() => openImagesModal(datasetName, () => refreshImageList(datasetName))}
               >
                 Add Images
               </Button>
+              <Button
+                className="text-gray-200 bg-slate-600 px-3 py-1 rounded-md flex items-center gap-2"
+                onClick={() => apiClient.post('/api/open-folder', { datasetName }).catch(error => console.error('Error opening folder:', error))}
+              >
+                <LuFolderOpen />
+                Open Folder
+              </Button>
             </div>
           </>
         )}
       </TopBar>
       <MainContent>
+        {scoringStatus?.status === 'running' && (
+          <div className="mb-4">
+            <div className="flex justify-between text-sm text-gray-400 mb-1">
+              <span>Scoring images...</span>
+              <span>{scoringStatus.scored} / {scoringStatus.total}</span>
+            </div>
+            <div className="w-full bg-gray-700 rounded-full h-2">
+              <div
+                className="bg-blue-500 h-2 rounded-full transition-all duration-300"
+                style={{ width: scoringStatus.total > 0 ? `${(scoringStatus.scored / scoringStatus.total) * 100}%` : '0%' }}
+              />
+            </div>
+          </div>
+        )}
+        {captioningStatus?.status === 'running' && (
+          <div className="mb-4">
+            <div className="flex justify-between text-sm text-gray-400 mb-1">
+              <span>Captioning images...</span>
+              <span>{captioningStatus.captioned} / {captioningStatus.total}</span>
+            </div>
+            <div className="w-full bg-gray-700 rounded-full h-2">
+              <div
+                className="bg-blue-500 h-2 rounded-full transition-all duration-300"
+                style={{ width: captioningStatus.total > 0 ? `${(captioningStatus.captioned / captioningStatus.total) * 100}%` : '0%' }}
+              />
+            </div>
+          </div>
+        )}
         {isSelectMode && (
           <p className="text-xs text-gray-400 mb-3">
             {isMergeMode
@@ -233,30 +547,51 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
         )}
         {PageInfoContent}
         {status === 'success' && imgList.length > 0 && (
-          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-            {imgList.map(img => (
-              <DatasetImageCard
-                key={img.img_path}
-                alt="image"
-                imageUrl={img.img_path}
-                currentDataset={datasetName}
-                onDelete={() => removeImageFromList(img.img_path)}
-                onSplit={() => refreshImageList(datasetName)}
-                onMerge={() => handleMergeStart(img.img_path)}
-                onEnlarge={() => setSelectedImage(img.img_path)}
-                isSelectMode={isSelectMode}
-                selected={selectedImages.has(img.img_path)}
-                onLongPress={() => handleLongPress(img.img_path)}
-                onSelect={() => handleSelect(img.img_path)}
-              />
-            ))}
-          </div>
+          <>
+            <div className="flex items-center gap-2 mb-4">
+              <label className="text-sm text-gray-400 whitespace-nowrap">Sort by:</label>
+              <select
+                value={sortBy}
+                onChange={e => setSortBy(e.target.value)}
+                className="bg-gray-700 text-gray-200 text-sm px-2 py-1 rounded-md border border-gray-600 focus:outline-none focus:ring-1 focus:ring-blue-500"
+              >
+                {sortOptions.map(opt => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+              {sortedImgList.map(img => (
+                <DatasetImageCard
+                  key={img.img_path}
+                  alt="image"
+                  imageUrl={img.img_path}
+                  currentDataset={datasetName}
+                  onDelete={() => removeImageFromList(img.img_path)}
+                  onSplit={() => refreshImageList(datasetName)}
+                  onMerge={() => handleMergeStart(img.img_path)}
+                  onEnlarge={() => setSelectedImage(img.img_path)}
+                  isSelectMode={isSelectMode}
+                  selected={selectedImages.has(img.img_path)}
+                  onLongPress={() => handleLongPress(img.img_path)}
+                  onSelect={() => handleSelect(img.img_path)}
+                  scoreRefreshKey={scoreRefreshKey}
+                  captionRefreshKey={captionRefreshKey}
+                />
+              ))}
+            </div>
+          </>
         )}
       </MainContent>
       <AddImagesModal />
+      <BulkCaptionModal
+        isOpen={isBulkCaptionModalOpen}
+        onClose={() => setIsBulkCaptionModalOpen(false)}
+        onStart={handleStartCaptioning}
+      />
       <DatasetImageViewer
         imgPath={selectedImage}
-        images={imgList.map(img => img.img_path).filter(path => !isAudio(path))}
+        images={sortedImgList.map(img => img.img_path).filter(path => !isAudio(path))}
         onChange={setSelectedImage}
       />
       <FullscreenDropOverlay
