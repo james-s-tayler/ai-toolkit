@@ -255,16 +255,24 @@ def get_ltx2_connectors_config() -> Tuple[
     return config, rename_dict, special_keys_remap
 
 
-def convert_ltx2_transformer(original_state_dict: Dict[str, Any]) -> Dict[str, Any]:
+def convert_ltx2_transformer(
+    original_state_dict: Dict[str, Any],
+    video_only: bool = False,
+):
+    """Convert an LTX-2 transformer state dict to a diffusers model.
+
+    Args:
+        original_state_dict: Raw state dict extracted from a combined checkpoint.
+        video_only: If ``True``, build a :class:`LTX2VideoOnlyTransformer3DModel`
+            that does not contain any audio modules.  Defaults to ``False``
+            (AV mode, existing behaviour).
+    """
     config, rename_dict, special_keys_remap = get_ltx2_transformer_config()
     diffusers_config = config["diffusers_config"]
 
     transformer_state_dict, _ = split_transformer_and_connector_state_dict(
         original_state_dict
     )
-
-    with init_empty_weights():
-        transformer = LTX2VideoTransformer3DModel.from_config(diffusers_config)
 
     # Handle official code --> diffusers key remapping via the remap dict
     for key in list(transformer_state_dict.keys()):
@@ -281,7 +289,20 @@ def convert_ltx2_transformer(original_state_dict: Dict[str, Any]) -> Dict[str, A
                 continue
             handler_fn_inplace(key, transformer_state_dict)
 
-    transformer.load_state_dict(transformer_state_dict, strict=True, assign=True)
+    if video_only:
+        from .ltx2_video_only_transformer import (
+            LTX2VideoOnlyTransformer3DModel,
+            is_audio_key,
+        )
+        # Filter out all audio-related keys from the renamed state dict
+        video_state_dict = {k: v for k, v in transformer_state_dict.items() if not is_audio_key(k)}
+        transformer = LTX2VideoOnlyTransformer3DModel.from_config(diffusers_config)
+        transformer.load_state_dict(video_state_dict, strict=False, assign=True)
+    else:
+        with init_empty_weights():
+            transformer = LTX2VideoTransformer3DModel.from_config(diffusers_config)
+        transformer.load_state_dict(transformer_state_dict, strict=True, assign=True)
+
     return transformer
 
 

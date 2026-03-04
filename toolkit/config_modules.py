@@ -687,7 +687,10 @@ class ModelConfig:
         self.model_paths = kwargs.get("model_paths", {})
         
         self.audio_loss_multiplier = kwargs.get("audio_loss_multiplier", 1.0)
-        
+
+        # LTX-2 mode: "av" (audio-visual, default) or "video" (video-only, no audio components)
+        self.ltx2_mode = kwargs.get("ltx2_mode", "av")
+
         # allow frontend to pass arch with a color like arch:tag
         # but remove the tag
         if self.arch is not None:

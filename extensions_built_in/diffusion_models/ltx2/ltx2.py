@@ -49,6 +49,7 @@ try:
         convert_lora_original_to_diffusers,
         convert_lora_diffusers_to_original,
     )
+    from .ltx2_video_only_transformer import LTX2VideoOnlyTransformer3DModel
 except ImportError as e:
     print("Diffusers import error:", e)
     raise ImportError(
@@ -208,7 +209,10 @@ class LTX2Model(BaseModel):
         )
         self.is_flow_matching = True
         self.is_transformer = True
-        self.target_lora_modules = ["LTX2VideoTransformer3DModel"]
+        self.target_lora_modules = [
+            "LTX2VideoTransformer3DModel",
+            "LTX2VideoOnlyTransformer3DModel",
+        ]
         # defines if the model supports model paths. Only some will
         self.supports_model_paths = True
         # use the new format on this new model by default
@@ -229,7 +233,10 @@ class LTX2Model(BaseModel):
     def load_model(self):
         dtype = self.torch_dtype
         verbose = self.model_config.verbose
+        is_video_only = (getattr(self.model_config, 'ltx2_mode', 'av') == 'video')
         print_verbose(verbose, f"load_model() called with dtype={dtype}")
+        if is_video_only:
+            print(f"LTX-2 mode: video (audio weights disabled)")
         self.print_and_status_update("Loading LTX2 model")
         model_path = self.model_config.name_or_path
         base_model_path = self.model_config.extras_name_or_path
@@ -250,8 +257,10 @@ class LTX2Model(BaseModel):
             original_dit_ckpt = get_model_state_dict_from_combined_ckpt(
                 combined_state_dict, dit_prefix
             )
-            transformer = convert_ltx2_transformer(original_dit_ckpt)
+            transformer = convert_ltx2_transformer(original_dit_ckpt, video_only=is_video_only)
             transformer = transformer.to(dtype)
+            if is_video_only:
+                print(f"Using LTX2VideoOnlyTransformer3DModel")
             print_verbose(verbose, f"Transformer converted and moved to dtype={dtype}")
         else:
             transformer_path = model_path
@@ -266,10 +275,17 @@ class LTX2Model(BaseModel):
                     base_model_path = model_path
                     print_verbose(verbose, f"Found full checkpoint, using as base_model_path: {base_model_path}")
 
-            print_verbose(verbose, f"Loading transformer from pretrained: path={transformer_path}, subfolder={transformer_subfolder}")
-            transformer = LTX2VideoTransformer3DModel.from_pretrained(
-                transformer_path, subfolder=transformer_subfolder, torch_dtype=dtype
-            )
+            if is_video_only:
+                print_verbose(verbose, f"Loading video-only transformer from: path={transformer_path}, subfolder={transformer_subfolder}")
+                print(f"Using LTX2VideoOnlyTransformer3DModel")
+                transformer = LTX2VideoOnlyTransformer3DModel.from_pretrained(
+                    transformer_path, subfolder=transformer_subfolder, torch_dtype=dtype
+                )
+            else:
+                print_verbose(verbose, f"Loading transformer from pretrained: path={transformer_path}, subfolder={transformer_subfolder}")
+                transformer = LTX2VideoTransformer3DModel.from_pretrained(
+                    transformer_path, subfolder=transformer_subfolder, torch_dtype=dtype
+                )
             print_verbose(verbose, f"Transformer loaded from pretrained")
 
         if self.model_config.quantize:
@@ -287,11 +303,13 @@ class LTX2Model(BaseModel):
             ignore_modules = []
             for block in transformer.transformer_blocks:
                 ignore_modules.append(block.scale_shift_table)
-                ignore_modules.append(block.audio_scale_shift_table)
-                ignore_modules.append(block.video_a2v_cross_attn_scale_shift_table)
-                ignore_modules.append(block.audio_a2v_cross_attn_scale_shift_table)
+                if not is_video_only:
+                    ignore_modules.append(block.audio_scale_shift_table)
+                    ignore_modules.append(block.video_a2v_cross_attn_scale_shift_table)
+                    ignore_modules.append(block.audio_a2v_cross_attn_scale_shift_table)
             ignore_modules.append(transformer.scale_shift_table)
-            ignore_modules.append(transformer.audio_scale_shift_table)
+            if not is_video_only:
+                ignore_modules.append(transformer.audio_scale_shift_table)
             print_verbose(verbose, f"Attaching MemoryManager to transformer with {len(ignore_modules)} ignored modules")
             MemoryManager.attach(
                 transformer,
@@ -459,24 +477,29 @@ class LTX2Model(BaseModel):
             vae = convert_ltx2_video_vae(original_vae_ckpt).to(dtype)
             print_verbose(verbose, f"Video VAE converted and moved to dtype={dtype}")
             del original_vae_ckpt
-            original_audio_vae_ckpt = get_model_state_dict_from_combined_ckpt(
-                combined_state_dict, audio_vae_prefix
-            )
-            audio_vae = convert_ltx2_audio_vae(original_audio_vae_ckpt).to(dtype)
-            print_verbose(verbose, f"Audio VAE converted and moved to dtype={dtype}")
-            del original_audio_vae_ckpt
+            if is_video_only:
+                print("Skipping audio_vae/vocoder load (video-only mode)")
+                audio_vae = None
+                vocoder = None
+            else:
+                original_audio_vae_ckpt = get_model_state_dict_from_combined_ckpt(
+                    combined_state_dict, audio_vae_prefix
+                )
+                audio_vae = convert_ltx2_audio_vae(original_audio_vae_ckpt).to(dtype)
+                print_verbose(verbose, f"Audio VAE converted and moved to dtype={dtype}")
+                del original_audio_vae_ckpt
+                original_vocoder_ckpt = get_model_state_dict_from_combined_ckpt(
+                    combined_state_dict, vocoder_prefix
+                )
+                vocoder = convert_ltx2_vocoder(original_vocoder_ckpt).to(dtype)
+                print_verbose(verbose, f"Vocoder converted and moved to dtype={dtype}")
+                del original_vocoder_ckpt
             original_connectors_ckpt = get_model_state_dict_from_combined_ckpt(
                 combined_state_dict, dit_prefix
             )
             connectors = convert_ltx2_connectors(original_connectors_ckpt).to(dtype)
             print_verbose(verbose, f"Connectors converted and moved to dtype={dtype}")
             del original_connectors_ckpt
-            original_vocoder_ckpt = get_model_state_dict_from_combined_ckpt(
-                combined_state_dict, vocoder_prefix
-            )
-            vocoder = convert_ltx2_vocoder(original_vocoder_ckpt).to(dtype)
-            print_verbose(verbose, f"Vocoder converted and moved to dtype={dtype}")
-            del original_vocoder_ckpt
             del combined_state_dict
             flush()
             print_verbose(verbose, f"Deleted checkpoints and flushed GPU cache")
@@ -486,20 +509,24 @@ class LTX2Model(BaseModel):
                 base_model_path, subfolder="vae", torch_dtype=dtype
             )
             print_verbose(verbose, f"Video VAE loaded from {base_model_path}/vae")
-            audio_vae = AutoencoderKLLTX2Audio.from_pretrained(
-                base_model_path, subfolder="audio_vae", torch_dtype=dtype
-            )
-            print_verbose(verbose, f"Audio VAE loaded from {base_model_path}/audio_vae")
+            if is_video_only:
+                print("Skipping audio_vae/vocoder load (video-only mode)")
+                audio_vae = None
+                vocoder = None
+            else:
+                audio_vae = AutoencoderKLLTX2Audio.from_pretrained(
+                    base_model_path, subfolder="audio_vae", torch_dtype=dtype
+                )
+                print_verbose(verbose, f"Audio VAE loaded from {base_model_path}/audio_vae")
+                vocoder = LTX2Vocoder.from_pretrained(
+                    base_model_path, subfolder="vocoder", torch_dtype=dtype
+                )
+                print_verbose(verbose, f"Vocoder loaded from {base_model_path}/vocoder")
 
             connectors = LTX2TextConnectors.from_pretrained(
                 base_model_path, subfolder="connectors", torch_dtype=dtype
             )
             print_verbose(verbose, f"Connectors loaded from {base_model_path}/connectors")
-
-            vocoder = LTX2Vocoder.from_pretrained(
-                base_model_path, subfolder="vocoder", torch_dtype=dtype
-            )
-            print_verbose(verbose, f"Vocoder loaded from {base_model_path}/vocoder")
 
         self.noise_scheduler = LTX2Model.get_train_scheduler()
         print_verbose(verbose, f"Noise scheduler created")
@@ -545,20 +572,27 @@ class LTX2Model(BaseModel):
         print_verbose(verbose, f"Text encoder configured and flushed GPU cache")
 
         # save it to the model class
-        self.vae = ComboVae(pipe.vae, pipe.audio_vae)
+        if is_video_only:
+            self.vae = pipe.vae  # video VAE only
+        else:
+            self.vae = ComboVae(pipe.vae, pipe.audio_vae)
         self.text_encoder = text_encoder  # list of text encoders
         self.tokenizer = tokenizer  # list of tokenizers
         self.model = pipe.transformer
         self.pipeline = pipe
         print_verbose(verbose, f"Model components saved to class attributes")
 
-        self.audio_processor = AudioProcessor(
-            sample_rate=pipe.audio_sampling_rate,
-            mel_bins=audio_vae.config.mel_bins,
-            mel_hop_length=pipe.audio_hop_length,
-            n_fft=1024,  # todo get this from vae if we can, I couldnt find it.
-        ).to(self.device_torch, dtype=torch.float32)
-        print_verbose(verbose, f"AudioProcessor created with sample_rate={pipe.audio_sampling_rate}, mel_bins={audio_vae.config.mel_bins}")
+        if is_video_only:
+            self.audio_processor = None
+            print_verbose(verbose, f"Skipping AudioProcessor setup (video-only mode)")
+        else:
+            self.audio_processor = AudioProcessor(
+                sample_rate=pipe.audio_sampling_rate,
+                mel_bins=audio_vae.config.mel_bins,
+                mel_hop_length=pipe.audio_hop_length,
+                n_fft=1024,  # todo get this from vae if we can, I couldnt find it.
+            ).to(self.device_torch, dtype=torch.float32)
+            print_verbose(verbose, f"AudioProcessor created with sample_rate={pipe.audio_sampling_rate}, mel_bins={audio_vae.config.mel_bins}")
 
         self.print_and_status_update("Model Loaded")
         print_verbose(verbose, f"load_model() completed successfully")
@@ -620,15 +654,18 @@ class LTX2Model(BaseModel):
     def get_generation_pipeline(self):
         scheduler = LTX2Model.get_train_scheduler()
 
+        audio_vae = getattr(self.pipeline, 'audio_vae', None)
+        vocoder = getattr(self.pipeline, 'vocoder', None)
+
         pipeline: LTX2Pipeline = LTX2Pipeline(
             scheduler=scheduler,
             vae=unwrap_model(self.pipeline.vae),
-            audio_vae=unwrap_model(self.pipeline.audio_vae),
+            audio_vae=unwrap_model(audio_vae) if audio_vae is not None else None,
             text_encoder=None,
             tokenizer=unwrap_model(self.pipeline.tokenizer),
             connectors=unwrap_model(self.pipeline.connectors),
             transformer=None,
-            vocoder=unwrap_model(self.pipeline.vocoder),
+            vocoder=unwrap_model(vocoder) if vocoder is not None else None,
         )
         pipeline.transformer = unwrap_model(self.model)
         pipeline.text_encoder = unwrap_model(self.text_encoder[0])
@@ -659,12 +696,12 @@ class LTX2Model(BaseModel):
             pipeline = LTX2ImageToVideoPipeline(
                 scheduler=pipeline.scheduler,
                 vae=pipeline.vae,
-                audio_vae=pipeline.audio_vae,
+                audio_vae=getattr(pipeline, 'audio_vae', None),
                 text_encoder=pipeline.text_encoder,
                 tokenizer=pipeline.tokenizer,
                 connectors=pipeline.connectors,
                 transformer=pipeline.transformer,
-                vocoder=pipeline.vocoder,
+                vocoder=getattr(pipeline, 'vocoder', None),
             )
             print_verbose(verbose, f"Switched to LTX2ImageToVideoPipeline")
 
@@ -765,13 +802,17 @@ class LTX2Model(BaseModel):
             # return as a dict, we will handle it with an override function
             video = (video * 255).round().astype("uint8")
             video = torch.from_numpy(video)
-            print_verbose(verbose, f"Video mode: converted output, video shape={video[0].shape}, audio shape={audio[0].shape}")
+            # In video-only mode audio may be None / empty tensor; provide silence if needed
+            audio_tensor = audio[0] if audio is not None and audio[0] is not None else torch.zeros(2, 0)
+            vocoder = getattr(pipeline, 'vocoder', None)
+            audio_sample_rate = vocoder.config.output_sampling_rate if vocoder is not None else 24000
+            print_verbose(verbose, f"Video mode: converted output, video shape={video[0].shape}")
             print_verbose(verbose, f"generate_single_image() completed, returning video dict")
             return {
                 "video": video[0],
                 "fps": gen_config.fps,
-                "audio": audio[0].float().cpu(),
-                "audio_sample_rate": pipeline.vocoder.config.output_sampling_rate,  # should be 24000
+                "audio": audio_tensor.float().cpu(),
+                "audio_sample_rate": audio_sample_rate,
                 "output_path": None,
             }
         else:
@@ -887,6 +928,7 @@ class LTX2Model(BaseModel):
         **kwargs,
     ):
         verbose = self.model_config.verbose
+        is_video_only = isinstance(self.model, LTX2VideoOnlyTransformer3DModel)
         print_verbose(verbose, f"get_noise_prediction() called: latent_input shape={latent_model_input.shape}, timestep={timestep}")
         with torch.no_grad():
             if self.model.device == torch.device("cpu"):
@@ -969,53 +1011,55 @@ class LTX2Model(BaseModel):
             )
             print_verbose(verbose, f"Latents packed, shape={packed_latents.shape}")
 
-            if batch.audio_latents is not None or batch.audio_tensor is not None:
-                print_verbose(verbose, f"Processing audio: has_cached_latents={batch.audio_latents is not None}, has_tensor={batch.audio_tensor is not None}")
-                if batch.audio_latents is not None:
-                    # we have audio latents cached
-                    raw_audio_latents = batch.audio_latents.to(
-                        self.device_torch, dtype=self.torch_dtype
-                    )
-                    print_verbose(verbose, f"Using cached audio latents, shape={raw_audio_latents.shape}")
-                else:
-                    # we have audio waveforms to encode
-                    # use audio from the batch if available
-                    print_verbose(verbose, f"Encoding audio from batch")
-                    raw_audio_latents = self.encode_audio(batch.audio_data)
-                    print_verbose(verbose, f"Audio encoded, latents shape={raw_audio_latents.shape}")
+            if not is_video_only:
+                # AV mode: prepare audio latents
+                if batch.audio_latents is not None or batch.audio_tensor is not None:
+                    print_verbose(verbose, f"Processing audio: has_cached_latents={batch.audio_latents is not None}, has_tensor={batch.audio_tensor is not None}")
+                    if batch.audio_latents is not None:
+                        # we have audio latents cached
+                        raw_audio_latents = batch.audio_latents.to(
+                            self.device_torch, dtype=self.torch_dtype
+                        )
+                        print_verbose(verbose, f"Using cached audio latents, shape={raw_audio_latents.shape}")
+                    else:
+                        # we have audio waveforms to encode
+                        # use audio from the batch if available
+                        print_verbose(verbose, f"Encoding audio from batch")
+                        raw_audio_latents = self.encode_audio(batch.audio_data)
+                        print_verbose(verbose, f"Audio encoded, latents shape={raw_audio_latents.shape}")
 
-                audio_num_frames = raw_audio_latents.shape[1]
-                # add the audio targets to the batch for loss calculation later
-                audio_noise = torch.randn_like(raw_audio_latents)
-                batch.audio_target = (audio_noise - raw_audio_latents).detach()
-                audio_latents = self.add_noise(
-                    raw_audio_latents,
-                    audio_noise,
-                    timestep,
-                ).to(self.device_torch, dtype=self.torch_dtype)
-                print_verbose(verbose, f"Audio noise added, audio_latents shape={audio_latents.shape}, audio_num_frames={audio_num_frames}")
-            else:
-                print_verbose(verbose, f"No audio in batch, preparing empty audio latents")
-                # no audio
-                num_mel_bins = self.pipeline.audio_vae.config.mel_bins
-                # latent_mel_bins = num_mel_bins // self.audio_vae_mel_compression_ratio
-                num_channels_latents_audio = (
-                    self.pipeline.audio_vae.config.latent_channels
-                )
-                audio_latents, audio_num_frames = self.pipeline.prepare_audio_latents(
-                    batch_size,
-                    num_channels_latents=num_channels_latents_audio,
-                    num_mel_bins=num_mel_bins,
-                    num_frames=batch.dataset_config.num_frames,
-                    frame_rate=frame_rate,
-                    sampling_rate=self.pipeline.audio_sampling_rate,
-                    hop_length=self.pipeline.audio_hop_length,
-                    dtype=torch.float32,
-                    device=self.transformer.device,
-                    generator=None,
-                    latents=None,
-                )
-                print_verbose(verbose, f"Prepared empty audio latents, shape={audio_latents.shape}, audio_num_frames={audio_num_frames}")
+                    audio_num_frames = raw_audio_latents.shape[1]
+                    # add the audio targets to the batch for loss calculation later
+                    audio_noise = torch.randn_like(raw_audio_latents)
+                    batch.audio_target = (audio_noise - raw_audio_latents).detach()
+                    audio_latents = self.add_noise(
+                        raw_audio_latents,
+                        audio_noise,
+                        timestep,
+                    ).to(self.device_torch, dtype=self.torch_dtype)
+                    print_verbose(verbose, f"Audio noise added, audio_latents shape={audio_latents.shape}, audio_num_frames={audio_num_frames}")
+                else:
+                    print_verbose(verbose, f"No audio in batch, preparing empty audio latents")
+                    # no audio
+                    num_mel_bins = self.pipeline.audio_vae.config.mel_bins
+                    # latent_mel_bins = num_mel_bins // self.audio_vae_mel_compression_ratio
+                    num_channels_latents_audio = (
+                        self.pipeline.audio_vae.config.latent_channels
+                    )
+                    audio_latents, audio_num_frames = self.pipeline.prepare_audio_latents(
+                        batch_size,
+                        num_channels_latents=num_channels_latents_audio,
+                        num_mel_bins=num_mel_bins,
+                        num_frames=batch.dataset_config.num_frames,
+                        frame_rate=frame_rate,
+                        sampling_rate=self.pipeline.audio_sampling_rate,
+                        hop_length=self.pipeline.audio_hop_length,
+                        dtype=torch.float32,
+                        device=self.transformer.device,
+                        generator=None,
+                        latents=None,
+                    )
+                    print_verbose(verbose, f"Prepared empty audio latents, shape={audio_latents.shape}, audio_num_frames={audio_num_frames}")
 
             if self.pipeline.connectors.device != self.transformer.device:
                 print_verbose(verbose, f"Moving connectors from {self.pipeline.connectors.device} to {self.transformer.device}")
@@ -1033,9 +1077,9 @@ class LTX2Model(BaseModel):
             ) = self.pipeline.connectors(
                 text_embeddings.text_embeds, additive_attention_mask, additive_mask=True
             )
-            print_verbose(verbose, f"Connector outputs: prompt_embeds shape={connector_prompt_embeds.shape}, audio_prompt_embeds shape={connector_audio_prompt_embeds.shape}")
+            print_verbose(verbose, f"Connector outputs: prompt_embeds shape={connector_prompt_embeds.shape}")
 
-            # compute video and audio positional ids
+            # compute video positional ids
             video_coords = self.transformer.rope.prepare_video_coords(
                 packed_latents.shape[0],
                 latent_num_frames,
@@ -1044,38 +1088,58 @@ class LTX2Model(BaseModel):
                 packed_latents.device,
                 fps=frame_rate,
             )
-            audio_coords = self.transformer.audio_rope.prepare_audio_coords(
-                audio_latents.shape[0], audio_num_frames, audio_latents.device
-            )
-            print_verbose(verbose, f"Prepared video and audio coordinates for transformer")
+            if not is_video_only:
+                audio_coords = self.transformer.audio_rope.prepare_audio_coords(
+                    audio_latents.shape[0], audio_num_frames, audio_latents.device
+                )
+                print_verbose(verbose, f"Prepared video and audio coordinates for transformer")
+            else:
+                print_verbose(verbose, f"Prepared video coordinates for transformer (video-only mode)")
 
         print_verbose(verbose, f"Running transformer forward pass")
-        noise_pred_video, noise_pred_audio = self.transformer(
-            hidden_states=packed_latents,
-            audio_hidden_states=audio_latents.to(self.transformer.dtype),
-            encoder_hidden_states=connector_prompt_embeds,
-            audio_encoder_hidden_states=connector_audio_prompt_embeds,
-            timestep=video_timestep,
-            audio_timestep=timestep,
-            encoder_attention_mask=connector_attention_mask,
-            audio_encoder_attention_mask=connector_attention_mask,
-            num_frames=latent_num_frames,
-            height=latent_height,
-            width=latent_width,
-            fps=frame_rate,
-            audio_num_frames=audio_num_frames,
-            video_coords=video_coords,
-            audio_coords=audio_coords,
-            # rope_interpolation_scale=rope_interpolation_scale,
-            attention_kwargs=None,
-            return_dict=False,
-        )
-        print_verbose(verbose, f"Transformer forward complete: noise_pred_video shape={noise_pred_video.shape}, noise_pred_audio shape={noise_pred_audio.shape}")
+        if is_video_only:
+            # Video-only forward: no audio inputs, returns (video_pred, None)
+            noise_pred_video, _ = self.transformer(
+                hidden_states=packed_latents,
+                encoder_hidden_states=connector_prompt_embeds,
+                timestep=video_timestep,
+                encoder_attention_mask=connector_attention_mask,
+                num_frames=latent_num_frames,
+                height=latent_height,
+                width=latent_width,
+                fps=frame_rate,
+                video_coords=video_coords,
+                return_dict=False,
+            )
+            print_verbose(verbose, f"Transformer forward complete (video-only): noise_pred_video shape={noise_pred_video.shape}")
+        else:
+            # AV mode: pass both video and audio inputs
+            noise_pred_video, noise_pred_audio = self.transformer(
+                hidden_states=packed_latents,
+                audio_hidden_states=audio_latents.to(self.transformer.dtype),
+                encoder_hidden_states=connector_prompt_embeds,
+                audio_encoder_hidden_states=connector_audio_prompt_embeds,
+                timestep=video_timestep,
+                audio_timestep=timestep,
+                encoder_attention_mask=connector_attention_mask,
+                audio_encoder_attention_mask=connector_attention_mask,
+                num_frames=latent_num_frames,
+                height=latent_height,
+                width=latent_width,
+                fps=frame_rate,
+                audio_num_frames=audio_num_frames,
+                video_coords=video_coords,
+                audio_coords=audio_coords,
+                # rope_interpolation_scale=rope_interpolation_scale,
+                attention_kwargs=None,
+                return_dict=False,
+            )
+            print_verbose(verbose, f"Transformer forward complete: noise_pred_video shape={noise_pred_video.shape}, noise_pred_audio shape={noise_pred_audio.shape}")
 
-        # add audio latent to batch if we had audio
-        if batch.audio_target is not None:
-            batch.audio_pred = noise_pred_audio
-            print_verbose(verbose, f"Stored audio prediction in batch for loss calculation")
+            # add audio latent to batch if we had audio
+            if batch.audio_target is not None:
+                batch.audio_pred = noise_pred_audio
+                print_verbose(verbose, f"Stored audio prediction in batch for loss calculation")
 
         unpacked_output = self.pipeline._unpack_latents(
             latents=noise_pred_video,
@@ -1168,7 +1232,7 @@ class LTX2Model(BaseModel):
     def save_model(self, output_path, meta, save_dtype):
         verbose = self.model_config.verbose
         print_verbose(verbose, f"save_model() called: output_path={output_path}, save_dtype={save_dtype}")
-        transformer: LTX2VideoTransformer3DModel = unwrap_model(self.model)
+        transformer = unwrap_model(self.model)
         transformer_save_path = os.path.join(output_path, "transformer")
         print_verbose(verbose, f"Saving transformer to {transformer_save_path}")
         transformer.save_pretrained(
