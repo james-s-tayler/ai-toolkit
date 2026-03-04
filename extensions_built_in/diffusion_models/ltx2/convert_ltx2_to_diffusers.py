@@ -295,7 +295,9 @@ def convert_ltx2_transformer(
             is_audio_key,
         )
         # Filter out all audio-related keys from the renamed state dict
+        audio_keys = [k for k in transformer_state_dict if is_audio_key(k)]
         video_state_dict = {k: v for k, v in transformer_state_dict.items() if not is_audio_key(k)}
+        print(f"LTX-2 video-only: filtered {len(audio_keys)} audio keys, kept {len(video_state_dict)} video keys")
         transformer = LTX2VideoOnlyTransformer3DModel.from_config(diffusers_config)
         transformer.load_state_dict(video_state_dict, strict=False, assign=True)
     else:

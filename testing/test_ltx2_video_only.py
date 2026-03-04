@@ -280,6 +280,12 @@ class TestLTX2VideoOnlyTransformer(unittest.TestCase):
 class TestModelConfigLtx2Mode(unittest.TestCase):
     """Tests for the ltx2_mode ModelConfig flag."""
 
+    def test_invalid_mode_raises(self):
+        """Invalid ltx2_mode values must raise ValueError."""
+        from toolkit.config_modules import ModelConfig
+        with self.assertRaises(ValueError):
+            ModelConfig(name_or_path="dummy/path", ltx2_mode="invalid")
+
     def test_default_is_av(self):
         """Default ltx2_mode must be 'av' for backward compatibility."""
         from toolkit.config_modules import ModelConfig

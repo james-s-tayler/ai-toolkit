@@ -347,13 +347,18 @@ class LTX2VideoOnlyTransformer3DModel(nn.Module):
 
     @property
     def config(self):
-        """Config-like object whose attributes mirror the constructor kwargs."""
-        class _Cfg:
-            pass
-        cfg = _Cfg()
-        for k, v in self._config.items():
-            setattr(cfg, k, v)
-        return cfg
+        """Config-like object whose attributes mirror the constructor kwargs.
+
+        The object is cached so repeated access is cheap.
+        """
+        if not hasattr(self, "_config_obj"):
+            class _Cfg:
+                pass
+            cfg = _Cfg()
+            for k, v in self._config.items():
+                setattr(cfg, k, v)
+            object.__setattr__(self, "_config_obj", cfg)
+        return self._config_obj
 
     @property
     def dtype(self) -> torch.dtype:
@@ -389,7 +394,11 @@ class LTX2VideoOnlyTransformer3DModel(nn.Module):
         fps: float = 24.0,
         video_coords: Optional[torch.Tensor] = None,
         return_dict: bool = True,
-        # Accept and silently ignore any audio-related keyword args
+        # Accept and silently ignore any audio-related keyword args for
+        # signature compatibility with call-sites that pass audio arguments.
+        # Ignored kwargs include: audio_hidden_states, audio_encoder_hidden_states,
+        # audio_timestep, audio_coords, audio_num_frames, audio_encoder_attention_mask,
+        # attention_kwargs.
         **kwargs,
     ):
         batch_size = hidden_states.size(0)

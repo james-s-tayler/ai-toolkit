@@ -803,6 +803,7 @@ class LTX2Model(BaseModel):
             video = (video * 255).round().astype("uint8")
             video = torch.from_numpy(video)
             # In video-only mode audio may be None / empty tensor; provide silence if needed
+            # 2 = stereo audio channels
             audio_tensor = audio[0] if audio is not None and audio[0] is not None else torch.zeros(2, 0)
             vocoder = getattr(pipeline, 'vocoder', None)
             audio_sample_rate = vocoder.config.output_sampling_rate if vocoder is not None else 24000
