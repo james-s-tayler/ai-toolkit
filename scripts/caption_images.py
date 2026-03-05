@@ -3,7 +3,10 @@
 Bulk AI captioning script for datasets using Qwen3-VL.
 
 Reads captioning config and image list from stdin as JSON:
-  { "images": [...], "trigger_word": "...", "system_prompt": "...", "model_id": "..." }
+  { "images": [...], "trigger_word": "...", "system_prompt": "...", "model_id": "...", "num_frames": 1 }
+
+num_frames controls how many evenly-spaced frames are extracted from each video
+and fed to the vision-language model (1–10; ignored for images; default 1).
 
 Outputs progress lines to stdout in the format: PROGRESS:captioned:total
 Captions are saved as .txt files alongside the images.
@@ -31,22 +34,50 @@ def get_txt_path(img_path: str) -> str:
     return base + '.txt'
 
 
-def get_video_middle_frame(video_path: str):
+def get_video_frames(video_path: str, num_frames: int = 1):
+    """Extract evenly-spaced frames from a video file.
+
+    When num_frames=1 the middle frame is returned (backward-compatible).
+    Returns a list of PIL Images.
+    """
     import cv2
     from PIL import Image
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
+
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    mid_frame = max(0, total_frames // 2)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, mid_frame)
-    ret, frame = cap.read()
+    if total_frames <= 0:
+        cap.release()
+        raise RuntimeError("Could not determine frame count for video")
+
+    num_frames = max(1, num_frames)
+
+    if num_frames == 1:
+        indices = [total_frames // 2]
+    else:
+        # Evenly space frames across the video (inclusive of first and last)
+        indices = [
+            int(round(i * (total_frames - 1) / (num_frames - 1)))
+            for i in range(num_frames)
+        ]
+
+    frames = []
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, min(idx, total_frames - 1)))
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(Image.fromarray(frame_rgb))
+
     cap.release()
-    if not ret:
-        raise RuntimeError("Could not read frame from video")
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(frame_rgb)
+
+    if not frames:
+        raise RuntimeError("Could not read any frames from video")
+
+    return frames
 
 
 def build_instruction(trigger: str, lora_focus: str) -> str:
@@ -63,7 +94,7 @@ def build_instruction(trigger: str, lora_focus: str) -> str:
     return CORE_CAPTION_INSTRUCTION
 
 
-def generate_caption(model, processor, device, image, instruction: str, trigger: str) -> str:
+def generate_caption(model, processor, device, images, instruction: str, trigger: str) -> str:
     from qwen_vl_utils import process_vision_info
     import torch
 
@@ -71,7 +102,7 @@ def generate_caption(model, processor, device, image, instruction: str, trigger:
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": image},
+                *[{"type": "image", "image": img} for img in images],
                 {"type": "text", "text": instruction},
             ],
         }
@@ -136,6 +167,7 @@ def main():
     trigger_word = data.get('trigger_word', '').strip()
     system_prompt = data.get('system_prompt', '').strip()
     model_id = data.get('model_id', MODEL_LITE)
+    num_frames = int(data.get('num_frames', 1))
 
     if model_id not in (MODEL_LITE, MODEL_FULL):
         model_id = MODEL_LITE
@@ -186,11 +218,11 @@ def main():
         try:
             ext = os.path.splitext(img_path)[1].lower()
             if ext in VIDEO_EXTENSIONS:
-                image = get_video_middle_frame(img_path)
+                images = get_video_frames(img_path, num_frames=max(1, num_frames))
             else:
-                image = Image.open(img_path).convert('RGB')
+                images = [Image.open(img_path).convert('RGB')]
 
-            caption = generate_caption(model, processor, device, image, instruction, trigger_word)
+            caption = generate_caption(model, processor, device, images, instruction, trigger_word)
 
             txt_path = get_txt_path(img_path)
             with open(txt_path, 'w', encoding='utf-8') as f:

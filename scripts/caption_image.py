@@ -30,8 +30,12 @@ MODEL_LITE = "prithivMLmods/Qwen3-VL-4B-Instruct-abliterated-v1"
 MODEL_FULL = "prithivMLmods/Qwen3-VL-8B-Abliterated-Caption-it"
 
 
-def get_video_middle_frame(video_path: str):
-    """Extract the middle frame from a video file."""
+def get_video_frames(video_path: str, num_frames: int = 1):
+    """Extract evenly-spaced frames from a video file.
+
+    When num_frames=1 the middle frame is returned (backward-compatible).
+    Returns a list of PIL Images.
+    """
     import cv2
     from PIL import Image
 
@@ -40,20 +44,39 @@ def get_video_middle_frame(video_path: str):
         raise RuntimeError(f"Could not open video: {video_path}")
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    mid_frame = max(0, total_frames // 2)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, mid_frame)
-    ret, frame = cap.read()
+    if total_frames <= 0:
+        cap.release()
+        raise RuntimeError("Could not determine frame count for video")
+
+    num_frames = max(1, num_frames)
+
+    if num_frames == 1:
+        indices = [total_frames // 2]
+    else:
+        # Evenly space frames across the video (inclusive of first and last)
+        indices = [
+            int(round(i * (total_frames - 1) / (num_frames - 1)))
+            for i in range(num_frames)
+        ]
+
+    frames = []
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, min(idx, total_frames - 1)))
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(Image.fromarray(frame_rgb))
+
     cap.release()
 
-    if not ret:
-        raise RuntimeError("Could not read frame from video")
+    if not frames:
+        raise RuntimeError("Could not read any frames from video")
 
-    # Convert BGR to RGB
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(frame_rgb)
+    return frames
 
 
-def caption_image(img_path: str, trigger_word: str, system_prompt: str, model_id: str) -> str:
+def caption_image(img_path: str, trigger_word: str, system_prompt: str, model_id: str, num_frames: int = 1) -> str:
     """Generate a caption for an image or video using Qwen3-VL."""
     from PIL import Image
     import torch
@@ -65,11 +88,11 @@ def caption_image(img_path: str, trigger_word: str, system_prompt: str, model_id
     ext = os.path.splitext(img_path)[1].lower()
     is_video = ext in video_extensions
 
-    # Load image or extract middle frame from video
+    # Load image(s) — videos yield one or more frames; images yield a single frame
     if is_video:
-        image = get_video_middle_frame(img_path)
+        images = get_video_frames(img_path, num_frames=max(1, num_frames))
     else:
-        image = Image.open(img_path).convert("RGB")
+        images = [Image.open(img_path).convert("RGB")]
 
     trigger = trigger_word.strip() if trigger_word and trigger_word.strip() else ""
 
@@ -120,7 +143,7 @@ def caption_image(img_path: str, trigger_word: str, system_prompt: str, model_id
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": image},
+                *[{"type": "image", "image": img} for img in images],
                 {"type": "text", "text": instruction},
             ],
         }
@@ -195,6 +218,12 @@ def main():
         choices=[MODEL_LITE, MODEL_FULL],
         help="Qwen3-VL model to use for captioning",
     )
+    parser.add_argument(
+        "--num_frames",
+        type=int,
+        default=1,
+        help="Number of evenly-spaced frames to extract from videos (ignored for images)",
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.img_path):
@@ -202,7 +231,7 @@ def main():
         sys.exit(1)
 
     try:
-        caption = caption_image(args.img_path, args.trigger_word, args.system_prompt, args.model_id)
+        caption = caption_image(args.img_path, args.trigger_word, args.system_prompt, args.model_id, num_frames=args.num_frames)
         print(json.dumps({"caption": caption}))
     except Exception as e:
         print(json.dumps({"error": str(e)}), file=sys.stderr)

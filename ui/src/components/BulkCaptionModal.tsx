@@ -13,7 +13,7 @@ interface CaptionPreset {
 interface BulkCaptionModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onStart: (options: { modelId: string; triggerWord: string; systemPrompt: string }) => void;
+  onStart: (options: { modelId: string; triggerWord: string; systemPrompt: string; numFrames: number }) => void;
 }
 
 const MODEL_LITE = 'prithivMLmods/Qwen3-VL-4B-Instruct-abliterated-v1';
@@ -31,6 +31,7 @@ export default function BulkCaptionModal({ isOpen, onClose, onStart }: BulkCapti
   const [triggerWord, setTriggerWord] = useState('');
   const [systemPrompt, setSystemPrompt] = useState(DEFAULT_SYSTEM_PROMPT);
   const [modelId, setModelId] = useState(MODEL_LITE);
+  const [numFrames, setNumFrames] = useState(1);
   const [presets, setPresets] = useState<CaptionPreset[]>([]);
 
   useEffect(() => setMounted(true), []);
@@ -46,12 +47,13 @@ export default function BulkCaptionModal({ isOpen, onClose, onStart }: BulkCapti
       setTriggerWord('');
       setSystemPrompt(DEFAULT_SYSTEM_PROMPT);
       setModelId(MODEL_LITE);
+      setNumFrames(1);
     }
   }, [isOpen]);
 
   const handleStart = useCallback(() => {
-    onStart({ modelId, triggerWord: triggerWord.trim(), systemPrompt: systemPrompt.trim() });
-  }, [modelId, triggerWord, systemPrompt, onStart]);
+    onStart({ modelId, triggerWord: triggerWord.trim(), systemPrompt: systemPrompt.trim(), numFrames });
+  }, [modelId, triggerWord, systemPrompt, numFrames, onStart]);
 
   if (!mounted) return null;
 
@@ -130,6 +132,26 @@ export default function BulkCaptionModal({ isOpen, onClose, onStart }: BulkCapti
                   />
                   <p className="mt-1 text-xs text-gray-500">
                     Tell the model what to focus on for every image in this dataset.
+                  </p>
+                </div>
+
+                <div>
+                  <label className="block text-sm text-gray-400 mb-1">
+                    Video Frames&nbsp;
+                    <span className="text-gray-300 font-medium">{numFrames}</span>
+                  </label>
+                  <input
+                    type="range"
+                    min={1}
+                    max={10}
+                    step={1}
+                    value={numFrames}
+                    onChange={e => setNumFrames(parseInt(e.target.value, 10))}
+                    className="w-full accent-blue-500"
+                    aria-label="Number of video frames"
+                  />
+                  <p className="mt-1 text-xs text-gray-500">
+                    Number of evenly-spaced frames to extract from each video and feed to the model (1–10). Ignored for images.
                   </p>
                 </div>
               </div>

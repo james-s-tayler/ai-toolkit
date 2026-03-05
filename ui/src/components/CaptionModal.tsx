@@ -4,6 +4,7 @@ import { createPortal } from 'react-dom';
 import { Dialog, DialogBackdrop, DialogPanel, DialogTitle } from '@headlessui/react';
 import { FaComment } from 'react-icons/fa';
 import { apiClient } from '@/utils/api';
+import { isVideo } from '@/utils/basic';
 
 interface CaptionPreset {
   name: string;
@@ -33,10 +34,13 @@ export default function CaptionModal({ imageUrl, isOpen, onClose, onCaptionGener
   const [triggerWord, setTriggerWord] = useState('');
   const [systemPrompt, setSystemPrompt] = useState(DEFAULT_SYSTEM_PROMPT);
   const [modelId, setModelId] = useState(MODEL_LITE);
+  const [numFrames, setNumFrames] = useState(1);
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [generatedCaption, setGeneratedCaption] = useState<string | null>(null);
   const [presets, setPresets] = useState<CaptionPreset[]>([]);
+
+  const isVideoFile = isVideo(imageUrl);
 
   useEffect(() => setMounted(true), []);
 
@@ -51,6 +55,7 @@ export default function CaptionModal({ imageUrl, isOpen, onClose, onCaptionGener
       setError(null);
       setGeneratedCaption(null);
       setIsGenerating(false);
+      setNumFrames(1);
     }
   }, [isOpen]);
 
@@ -70,6 +75,7 @@ export default function CaptionModal({ imageUrl, isOpen, onClose, onCaptionGener
         triggerWord: triggerWord.trim(),
         systemPrompt: systemPrompt.trim(),
         modelId,
+        numFrames,
       });
       const caption = res.data?.caption ?? '';
       setGeneratedCaption(caption);
@@ -172,6 +178,29 @@ export default function CaptionModal({ imageUrl, isOpen, onClose, onCaptionGener
                     Tell the model what to focus on (e.g. "Describe clothing style and fit in detail.").
                   </p>
                 </div>
+
+                {isVideoFile && (
+                  <div>
+                    <label className="block text-sm text-gray-400 mb-1">
+                      Video Frames&nbsp;
+                      <span className="text-gray-300 font-medium">{numFrames}</span>
+                    </label>
+                    <input
+                      type="range"
+                      min={1}
+                      max={10}
+                      step={1}
+                      value={numFrames}
+                      onChange={e => setNumFrames(parseInt(e.target.value, 10))}
+                      disabled={isGenerating}
+                      className="w-full accent-blue-500 disabled:opacity-50"
+                      aria-label="Number of video frames"
+                    />
+                    <p className="mt-1 text-xs text-gray-500">
+                      Number of evenly-spaced frames to extract from the video and feed to the model (1–10).
+                    </p>
+                  </div>
+                )}
 
                 {generatedCaption !== null && (
                   <div>

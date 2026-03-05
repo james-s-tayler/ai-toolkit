@@ -349,7 +349,7 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
   }, [stopCaptioningPoll]);
 
   const handleStartCaptioning = useCallback(
-    async (options: { modelId: string; triggerWord: string; systemPrompt: string }) => {
+    async (options: { modelId: string; triggerWord: string; systemPrompt: string; numFrames: number }) => {
       setIsBulkCaptionModalOpen(false);
       try {
         const res = await apiClient.post('/api/datasets/captionImages', {
@@ -357,6 +357,7 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
           triggerWord: options.triggerWord,
           systemPrompt: options.systemPrompt,
           modelId: options.modelId,
+          numFrames: options.numFrames,
         });
         const data: CaptioningStatus = res.data;
         setCaptioningStatus(data);

@@ -19,7 +19,7 @@ const ALLOWED_MODELS = new Set([
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const { imgPath, triggerWord, systemPrompt, modelId } = body;
+    const { imgPath, triggerWord, systemPrompt, modelId, numFrames } = body;
 
     if (!imgPath || typeof imgPath !== 'string') {
       return NextResponse.json({ error: 'imgPath is required' }, { status: 400 });
@@ -34,6 +34,9 @@ export async function POST(request: Request) {
     if (!ALLOWED_MODELS.has(resolvedModelId)) {
       return NextResponse.json({ error: 'Invalid model ID' }, { status: 400 });
     }
+
+    const parsedNumFrames = parseInt(numFrames, 10);
+    const resolvedNumFrames = Math.min(10, Math.max(1, Number.isNaN(parsedNumFrames) ? 1 : parsedNumFrames));
 
     const datasetsPath = await getDatasetsRoot();
 
@@ -56,6 +59,7 @@ export async function POST(request: Request) {
       '--trigger_word', (triggerWord || '').toString(),
       '--system_prompt', (systemPrompt || '').toString(),
       '--model_id', resolvedModelId,
+      '--num_frames', resolvedNumFrames.toString(),
     ];
 
     const { stdout } = await execFileAsync(PYTHON_EXECUTABLE, args, {

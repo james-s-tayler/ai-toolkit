@@ -78,7 +78,7 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   const body = await request.json();
-  const { datasetName, triggerWord, systemPrompt, modelId } = body;
+  const { datasetName, triggerWord, systemPrompt, modelId, numFrames } = body;
 
   if (!datasetName || typeof datasetName !== 'string' || datasetName.trim() === '') {
     return NextResponse.json({ error: 'Invalid dataset name' }, { status: 400 });
@@ -91,6 +91,9 @@ export async function POST(request: Request) {
   if (!ALLOWED_MODELS.has(resolvedModelId)) {
     return NextResponse.json({ error: 'Invalid model ID' }, { status: 400 });
   }
+
+  const parsedNumFrames = parseInt(numFrames, 10);
+  const resolvedNumFrames = Math.min(10, Math.max(1, Number.isNaN(parsedNumFrames) ? 1 : parsedNumFrames));
 
   const datasetsPath = await getDatasetsRoot();
   const datasetFolder = path.join(datasetsPath, datasetName);
@@ -131,6 +134,7 @@ export async function POST(request: Request) {
     trigger_word: (triggerWord || '').toString(),
     system_prompt: (systemPrompt || '').toString(),
     model_id: resolvedModelId,
+    num_frames: resolvedNumFrames,
   });
   proc.stdin.write(input);
   proc.stdin.end();
