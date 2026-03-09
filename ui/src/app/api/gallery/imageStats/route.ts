@@ -4,18 +4,9 @@ import path from 'path';
 import sharp from 'sharp';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { getDatasetsRoot } from '@/server/settings';
 import { videoExtensions } from '@/utils/basic';
 
 const execFileAsync = promisify(execFile);
-
-interface ImageStats {
-  totalCount: number;
-  imageCount: number;
-  videoCount: number;
-  totalVideoDuration: number;
-  resolutionBreakdown: { [resolution: string]: number };
-}
 
 async function getVideoDuration(videoPath: string): Promise<number> {
   try {
@@ -33,48 +24,38 @@ async function getVideoDuration(videoPath: string): Promise<number> {
 }
 
 export async function GET(request: Request) {
-  const datasetsPath = await getDatasetsRoot();
   const { searchParams } = new URL(request.url);
-  const datasetName = searchParams.get('datasetName');
+  const folderPath = searchParams.get('folderPath');
 
-  // Validate datasetName
-  if (!datasetName || typeof datasetName !== 'string' || datasetName.trim() === '') {
-    return NextResponse.json({ error: 'Invalid dataset name' }, { status: 400 });
+  if (!folderPath || typeof folderPath !== 'string') {
+    return NextResponse.json({ error: 'folderPath is required' }, { status: 400 });
   }
 
-  // Prevent path traversal attacks
-  if (datasetName.includes('..') || datasetName.includes('/') || datasetName.includes('\\')) {
-    return NextResponse.json({ error: 'Invalid dataset name' }, { status: 400 });
+  // Prevent path traversal
+  const normalizedPath = path.normalize(folderPath);
+  if (normalizedPath.includes('..')) {
+    return NextResponse.json({ error: 'Invalid folder path' }, { status: 400 });
   }
 
-  const datasetFolder = path.join(datasetsPath, datasetName);
-
-  // Verify the resolved path is within datasetsPath
-  if (!datasetFolder.startsWith(datasetsPath)) {
-    return NextResponse.json({ error: 'Invalid dataset path' }, { status: 400 });
-  }
-
-  // Check if folder exists
   try {
-    await fs.promises.access(datasetFolder);
+    const stat = await fs.promises.stat(normalizedPath);
+    if (!stat.isDirectory()) {
+      return NextResponse.json({ error: 'Folder not found' }, { status: 404 });
+    }
   } catch {
-    return NextResponse.json({ error: `Folder '${datasetName}' not found` }, { status: 404 });
+    return NextResponse.json({ error: 'Folder not found' }, { status: 404 });
   }
 
-  // Initialize stats with defaults
   let totalCount = 0;
   let imageCount = 0;
   let videoCount = 0;
   let totalVideoDuration = 0;
   const resolutionBreakdown: { [resolution: string]: number } = {};
-  let hasError = false;
 
   try {
-    // Find all images recursively (async to avoid blocking the event loop)
-    const imageFiles = await findImagesRecursively(datasetFolder);
+    const imageFiles = await findImagesInFolder(normalizedPath);
     totalCount = imageFiles.length;
 
-    // Separate video files from image files in a single pass
     const videoFiles: string[] = [];
     const nonVideoFiles: string[] = [];
     for (const f of imageFiles) {
@@ -87,7 +68,6 @@ export async function GET(request: Request) {
     imageCount = nonVideoFiles.length;
     videoCount = videoFiles.length;
 
-    // Get video durations concurrently
     const CONCURRENCY_LIMIT = 10;
     for (let i = 0; i < videoFiles.length; i += CONCURRENCY_LIMIT) {
       const batch = videoFiles.slice(i, i + CONCURRENCY_LIMIT);
@@ -95,7 +75,6 @@ export async function GET(request: Request) {
       totalVideoDuration += durations.reduce((sum, d) => sum + d, 0);
     }
 
-    // Get resolution for each image with concurrent processing
     for (let i = 0; i < nonVideoFiles.length; i += CONCURRENCY_LIMIT) {
       const batch = nonVideoFiles.slice(i, i + CONCURRENCY_LIMIT);
       await Promise.allSettled(
@@ -106,9 +85,7 @@ export async function GET(request: Request) {
             const height = metadata.height || 0;
             const resolution = `${width}x${height}`;
             resolutionBreakdown[resolution] = (resolutionBreakdown[resolution] || 0) + 1;
-          } catch (error) {
-            console.error(`Error reading image metadata for ${imgPath}:`, error);
-            // If we can't read the image, count it as unknown
+          } catch {
             const unknownKey = 'unknown resolution';
             resolutionBreakdown[unknownKey] = (resolutionBreakdown[unknownKey] || 0) + 1;
           }
@@ -116,31 +93,14 @@ export async function GET(request: Request) {
       );
     }
   } catch (error) {
-    console.error('Error calculating image stats:', error);
-    hasError = true;
+    console.error('Error calculating gallery image stats:', error);
   }
 
-  // Always return stats with what we have, even if there were errors
-  const stats: ImageStats = {
-    totalCount,
-    imageCount,
-    videoCount,
-    totalVideoDuration,
-    resolutionBreakdown,
-  };
-
-  return NextResponse.json(stats);
+  return NextResponse.json({ totalCount, imageCount, videoCount, totalVideoDuration, resolutionBreakdown });
 }
 
-/**
- * Recursively finds all image files in a directory and its subdirectories.
- * Uses an iterative BFS with async I/O to avoid blocking the event loop,
- * unbounded concurrency, and symlink loops.
- * @param dir Directory to search
- * @returns Array of absolute paths to image files
- */
-async function findImagesRecursively(dir: string): Promise<string[]> {
-  const imageExtensions = ['.png', '.jpg', '.jpeg', '.webp', '.mp4', '.avi', '.mov', '.mkv', '.wmv', '.m4v', '.flv'];
+async function findImagesInFolder(dir: string): Promise<string[]> {
+  const imageExtensions = ['.png', '.jpg', '.jpeg', '.webp', '.mp4', '.avi', '.mov', '.mkv', '.wmv', '.m4v', '.flv', '.mp3', '.wav'];
   const results: string[] = [];
   const queue: string[] = [dir];
 
@@ -156,7 +116,7 @@ async function findImagesRecursively(dir: string): Promise<string[]> {
       // Skip symlinks to avoid loops and unintended traversal
       if (dirent.isSymbolicLink()) continue;
       const itemPath = path.join(current, dirent.name);
-      if (dirent.isDirectory() && dirent.name !== '_controls' && !dirent.name.startsWith('.')) {
+      if (dirent.isDirectory() && !dirent.name.startsWith('.')) {
         queue.push(itemPath);
       } else if (dirent.isFile()) {
         const ext = path.extname(dirent.name).toLowerCase();
