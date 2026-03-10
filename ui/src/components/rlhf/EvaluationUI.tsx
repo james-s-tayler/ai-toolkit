@@ -170,7 +170,7 @@ export default function EvaluationUI({ sessionId, sessionStatus }: Props) {
           ) : (
             <div className="w-full h-full flex items-center justify-center text-gray-600">No image</div>
           )}
-          <div className="absolute bottom-2 left-2 bg-black/60 text-white text-xs px-2 py-1 rounded">A · Press A</div>
+          <div className="absolute bottom-2 left-2 bg-black/60 text-white text-xs px-2 py-1 rounded">Left · Press A</div>
         </div>
 
         {/* Right image */}
@@ -186,7 +186,7 @@ export default function EvaluationUI({ sessionId, sessionStatus }: Props) {
           ) : (
             <div className="w-full h-full flex items-center justify-center text-gray-600">No image</div>
           )}
-          <div className="absolute bottom-2 right-2 bg-black/60 text-white text-xs px-2 py-1 rounded">B · Press D</div>
+          <div className="absolute bottom-2 right-2 bg-black/60 text-white text-xs px-2 py-1 rounded">Right · Press D</div>
         </div>
       </div>
 

@@ -132,7 +132,10 @@ export default async function processRlhfGeneration() {
 
         for (const pair of pendingPairs) {
           try {
-            // JSON-escape the prompt to prevent malformed JSON when substituted into the template
+            // Escape the prompt for safe JSON template substitution.
+            // JSON.stringify wraps the value in quotes and escapes special chars.
+            // We slice off the surrounding quotes since {{PROMPT}} is already
+            // inside a JSON string literal in the workflow template.
             const escapedPrompt = JSON.stringify(pair.prompt).slice(1, -1);
             const workflowA = workflowTemplate.replace(/\{\{PROMPT\}\}/g, escapedPrompt).replace(/\{\{SEED\}\}/g, String(pair.seed_a));
             const workflowB = workflowTemplate.replace(/\{\{PROMPT\}\}/g, escapedPrompt).replace(/\{\{SEED\}\}/g, String(pair.seed_b));

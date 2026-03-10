@@ -50,8 +50,8 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           data: {
             session_id: sessionId,
             prompt,
-            seed_a: randomInt(2147483647),
-            seed_b: randomInt(2147483647),
+            seed_a: randomInt(0, 2147483648),
+            seed_b: randomInt(0, 2147483648),
           },
         })
       )

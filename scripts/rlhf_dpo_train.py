@@ -26,6 +26,7 @@ Output status.json (written every 10 steps):
 """
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -124,7 +125,11 @@ def encode_images_to_latents(vae, image_paths, resolution, dtype, device, cache_
     for path in image_paths:
         cache_path = cache_dir / (Path(path).stem + "_latent.pt")
         if cache_path.exists():
-            latents[path] = torch.load(cache_path, map_location="cpu", weights_only=True)
+            try:
+                latents[path] = torch.load(cache_path, map_location="cpu", weights_only=True)
+            except TypeError:
+                # weights_only parameter not available in older PyTorch versions
+                latents[path] = torch.load(cache_path, map_location="cpu")  # noqa: S614
             continue
 
         img_tensor = load_and_preprocess_image(path, resolution).to(device, dtype=dtype)
@@ -144,9 +149,14 @@ def encode_prompts_to_embeddings(text_encoder, tokenizer, prompts, device, cache
     embeddings = {}
 
     for prompt in set(prompts):
-        cache_path = cache_dir / f"emb_{hash(prompt) & 0xFFFFFF:06x}.pt"
+        prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:12]
+        cache_path = cache_dir / f"emb_{prompt_hash}.pt"
         if cache_path.exists():
-            embeddings[prompt] = torch.load(cache_path, map_location="cpu", weights_only=True)
+            try:
+                embeddings[prompt] = torch.load(cache_path, map_location="cpu", weights_only=True)
+            except TypeError:
+                # weights_only parameter not available in older PyTorch versions
+                embeddings[prompt] = torch.load(cache_path, map_location="cpu")  # noqa: S614
             continue
 
         inputs = tokenizer(
