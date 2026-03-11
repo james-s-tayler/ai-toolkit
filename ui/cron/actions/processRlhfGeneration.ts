@@ -80,8 +80,14 @@ export default async function processRlhfGeneration() {
 
       for (const pair of queuedPairs) {
         try {
-          let aCompleted = !pair.comfyui_id_a || !!pair.image_a_path;
-          let bCompleted = !pair.comfyui_id_b || !!pair.image_b_path;
+          // A pair needs both valid comfyui IDs and downloaded images to be complete.
+          // If IDs are missing, the submission failed — don't mark as completed.
+          if (!pair.comfyui_id_a || !pair.comfyui_id_b) {
+            await prisma.rlhfPair.update({ where: { id: pair.id }, data: { gen_status: 'error' } });
+            continue;
+          }
+          let aCompleted = !!pair.image_a_path;
+          let bCompleted = !!pair.image_b_path;
 
           if (pair.comfyui_id_a && !pair.image_a_path) {
             const history = await httpGet(`${comfyUrl}/history/${pair.comfyui_id_a}`);
@@ -157,8 +163,18 @@ export default async function processRlhfGeneration() {
             }
             const resA = await httpPost(`${comfyUrl}/prompt`, { prompt: parsedA });
             const comfyui_id_a = resA.prompt_id || '';
+            if (!comfyui_id_a) {
+              console.error(`[rlhf] ComfyUI rejected pair ${pair.id} image A:`, JSON.stringify(resA));
+              await prisma.rlhfPair.update({ where: { id: pair.id }, data: { gen_status: 'error' } });
+              continue;
+            }
             const resB = await httpPost(`${comfyUrl}/prompt`, { prompt: parsedB });
             const comfyui_id_b = resB.prompt_id || '';
+            if (!comfyui_id_b) {
+              console.error(`[rlhf] ComfyUI rejected pair ${pair.id} image B:`, JSON.stringify(resB));
+              await prisma.rlhfPair.update({ where: { id: pair.id }, data: { gen_status: 'error' } });
+              continue;
+            }
 
             await prisma.rlhfPair.update({
               where: { id: pair.id },
