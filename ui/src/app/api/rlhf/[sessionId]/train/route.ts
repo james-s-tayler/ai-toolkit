@@ -133,15 +133,15 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       CUDA_VISIBLE_DEVICES: session.gpu_ids,
     };
 
-    const logStream = fs.createWriteStream(logPath, { flags: 'a' });
+    const logFd = fs.openSync(logPath, 'a');
     const subprocess = spawn(pythonPath, args, {
       detached: true,
-      stdio: ['ignore', logStream, logStream],
+      stdio: ['ignore', logFd, logFd],
       env: { ...process.env, ...additionalEnv },
       cwd: TOOLKIT_ROOT,
     });
 
-    subprocess.on('close', () => { logStream.close(); });
+    subprocess.on('close', () => { fs.closeSync(logFd); });
     if (subprocess.unref) subprocess.unref();
 
     const pid = subprocess.pid;
@@ -149,8 +149,8 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     await prisma.rlhfSession.update({ where: { id: sessionId }, data: { status: 'training' } });
 
     return NextResponse.json(run);
-  } catch (error) {
+  } catch (error: any) {
     console.error(error);
-    return NextResponse.json({ error: 'Failed to start training' }, { status: 500 });
+    return NextResponse.json({ error: 'Failed to start training', details: error?.message || String(error) }, { status: 500 });
   }
 }

@@ -577,10 +577,64 @@ def main():
     print(f"[rlhf] Text encoder unloaded, {len(embed_cache)} embeddings cached")
 
     # -----------------------------------------------------------------------
-    # Move transformer to device and set up optimizer
+    # Move transformer to device (with optional block swapping for low VRAM)
     # -----------------------------------------------------------------------
-    transformer = transformer.to(device)
-    lora_network = lora_network.to(device)
+    blocks_to_swap = args.blocks_to_swap
+    if blocks_to_swap > 0:
+        # Block swapping: keep N blocks on CPU, move to GPU on-the-fly during
+        # forward/backward.  The non-block parameters (patch embed, final norm,
+        # etc.) always stay on GPU since they are small.
+        print(f"[rlhf] Block swapping enabled: {blocks_to_swap} of 32 blocks on CPU")
+
+        # Identify the block lists.
+        # ZImageTransformer2DModel uses: layers, noise_refiner, context_refiner
+        block_attrs = ["layers", "noise_refiner", "context_refiner"]
+        all_blocks = []
+        for attr in block_attrs:
+            bl = getattr(transformer, attr, None)
+            if bl is not None:
+                all_blocks.extend(list(bl))
+
+        n_swap = min(blocks_to_swap, len(all_blocks))
+        gpu_blocks = all_blocks[: len(all_blocks) - n_swap]
+        cpu_blocks = all_blocks[len(all_blocks) - n_swap :]
+        print(f"[rlhf]   Total blocks: {len(all_blocks)}, on GPU: {len(gpu_blocks)}, on CPU: {len(cpu_blocks)}")
+
+        # Start with everything on CPU, then selectively move to GPU
+        transformer = transformer.to("cpu")
+
+        # Move non-block params (embedders, norms, etc.) to GPU
+        block_prefixes = tuple(a + "." for a in block_attrs)
+        for name, param in transformer.named_parameters():
+            if not name.startswith(block_prefixes):
+                param.data = param.data.to(device)
+        for name, buf in transformer.named_buffers():
+            if not name.startswith(block_prefixes):
+                buf.data = buf.data.to(device)
+
+        # Move GPU-resident blocks
+        for block in gpu_blocks:
+            block.to(device)
+
+        # Register forward hooks to swap CPU blocks to/from GPU on demand
+        def _make_pre_hook(block_ref):
+            def hook(module, args):
+                block_ref.to(device)
+            return hook
+        def _make_post_hook(block_ref):
+            def hook(module, args, output):
+                block_ref.to("cpu")
+                torch.cuda.empty_cache()
+            return hook
+        for block in cpu_blocks:
+            block.register_forward_pre_hook(_make_pre_hook(block))
+            block.register_forward_hook(_make_post_hook(block))
+
+        lora_network = lora_network.to(device)
+    else:
+        transformer = transformer.to(device)
+        lora_network = lora_network.to(device)
+
     transformer.requires_grad_(False)  # Freeze base weights
     lora_network.train()
 
