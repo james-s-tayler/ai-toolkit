@@ -83,6 +83,11 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
 
   useEffect(() => { fetchSession(); fetchEvaluatedCount(); }, [fetchSession, fetchEvaluatedCount]);
 
+  // Re-fetch evaluated count when switching to training tab so it's always current
+  useEffect(() => {
+    if (tab === 'training') fetchEvaluatedCount();
+  }, [tab, fetchEvaluatedCount]);
+
   useEffect(() => {
     if (tab === 'pairs') fetchPairs(pairsPage, pairsFilter, prefFilter);
   }, [tab, pairsPage, pairsFilter, prefFilter, fetchPairs]);
