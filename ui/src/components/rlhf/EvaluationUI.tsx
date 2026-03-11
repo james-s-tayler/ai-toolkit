@@ -19,6 +19,7 @@ interface Props {
 export default function EvaluationUI({ sessionId, sessionStatus }: Props) {
   const [currentPair, setCurrentPair] = useState<RlhfPair | null>(null);
   const [prefetchedPairs, setPrefetchedPairs] = useState<RlhfPair[]>([]);
+  const prefetchedRef = useRef<RlhfPair[]>([]);
   const [stats, setStats] = useState<EvalStats>({ total: 0, evaluated: 0, skipped: 0, remaining: 0 });
   const [isLoading, setIsLoading] = useState(true);
   const [flash, setFlash] = useState<'left' | 'right' | null>(null);
@@ -26,6 +27,9 @@ export default function EvaluationUI({ sessionId, sessionStatus }: Props) {
   // Randomize which image (A or B) appears on the left to reduce order bias
   const [swapped, setSwapped] = useState(false);
   const isSendingRef = useRef(false);
+
+  // Keep ref in sync with state to avoid stale closures
+  useEffect(() => { prefetchedRef.current = prefetchedPairs; }, [prefetchedPairs]);
 
   const fetchNext = useCallback(async (prefetched?: RlhfPair[]) => {
     if (prefetched && prefetched.length > 0) {
@@ -78,10 +82,10 @@ export default function EvaluationUI({ sessionId, sessionStatus }: Props) {
 
     setTimeout(() => {
       setFlash(null);
-      fetchNext(prefetchedPairs);
+      fetchNext(prefetchedRef.current);
       isSendingRef.current = false;
     }, 200);
-  }, [currentPair, swapped, prefetchedPairs, fetchNext, sessionId]);
+  }, [currentPair, swapped, fetchNext, sessionId]);
 
   const handleUndo = useCallback(async () => {
     if (history.length === 0) return;

@@ -133,13 +133,15 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       CUDA_VISIBLE_DEVICES: session.gpu_ids,
     };
 
+    const logStream = fs.createWriteStream(logPath, { flags: 'a' });
     const subprocess = spawn(pythonPath, args, {
       detached: true,
-      stdio: 'ignore',
+      stdio: ['ignore', logStream, logStream],
       env: { ...process.env, ...additionalEnv },
       cwd: TOOLKIT_ROOT,
     });
 
+    subprocess.on('close', () => { logStream.close(); });
     if (subprocess.unref) subprocess.unref();
 
     const pid = subprocess.pid;

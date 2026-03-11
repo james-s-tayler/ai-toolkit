@@ -52,9 +52,15 @@ async function downloadFile(url: string, destPath: string): Promise<void> {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     const file = fs.createWriteStream(destPath);
     lib.get(url, (res: any) => {
+      if (res.statusCode !== 200) {
+        file.close();
+        fs.unlink(destPath, () => {});
+        reject(new Error(`HTTP ${res.statusCode} downloading ${url}`));
+        return;
+      }
       res.pipe(file);
-      file.on('finish', () => { file.close(); resolve(); });
-    }).on('error', (err: Error) => { fs.unlink(destPath, () => {}); reject(err); });
+      file.on('finish', () => { file.close(() => resolve()); });
+    }).on('error', (err: Error) => { file.close(); fs.unlink(destPath, () => {}); reject(err); });
   });
 }
 
@@ -122,13 +128,12 @@ export default async function processRlhfGeneration() {
       const alreadyQueued = await prisma.rlhfPair.count({ where: { session_id: session.id, gen_status: 'queued' } });
       const slotsAvailable = BATCH_SIZE - alreadyQueued;
 
-      if (slotsAvailable > 0) {
+      const workflowTemplate = session.workflow_json;
+      if (slotsAvailable > 0 && workflowTemplate) {
         const pendingPairs = await prisma.rlhfPair.findMany({
           where: { session_id: session.id, gen_status: 'pending' },
           take: slotsAvailable,
         });
-
-        const workflowTemplate = session.workflow_json;
 
         for (const pair of pendingPairs) {
           try {
@@ -140,25 +145,20 @@ export default async function processRlhfGeneration() {
             const workflowA = workflowTemplate.replace(/\{\{PROMPT\}\}/g, escapedPrompt).replace(/\{\{SEED\}\}/g, String(pair.seed_a));
             const workflowB = workflowTemplate.replace(/\{\{PROMPT\}\}/g, escapedPrompt).replace(/\{\{SEED\}\}/g, String(pair.seed_b));
 
-            let comfyui_id_a = '';
-            let comfyui_id_b = '';
-
-            if (workflowTemplate) {
-              let parsedA: any;
-              let parsedB: any;
-              try {
-                parsedA = JSON.parse(workflowA);
-                parsedB = JSON.parse(workflowB);
-              } catch (parseErr) {
-                console.error(`[rlhf] Invalid workflow JSON for pair ${pair.id}:`, parseErr);
-                await prisma.rlhfPair.update({ where: { id: pair.id }, data: { gen_status: 'error' } });
-                continue;
-              }
-              const resA = await httpPost(`${comfyUrl}/prompt`, { prompt: parsedA });
-              comfyui_id_a = resA.prompt_id || '';
-              const resB = await httpPost(`${comfyUrl}/prompt`, { prompt: parsedB });
-              comfyui_id_b = resB.prompt_id || '';
+            let parsedA: any;
+            let parsedB: any;
+            try {
+              parsedA = JSON.parse(workflowA);
+              parsedB = JSON.parse(workflowB);
+            } catch (parseErr) {
+              console.error(`[rlhf] Invalid workflow JSON for pair ${pair.id}:`, parseErr);
+              await prisma.rlhfPair.update({ where: { id: pair.id }, data: { gen_status: 'error' } });
+              continue;
             }
+            const resA = await httpPost(`${comfyUrl}/prompt`, { prompt: parsedA });
+            const comfyui_id_a = resA.prompt_id || '';
+            const resB = await httpPost(`${comfyUrl}/prompt`, { prompt: parsedB });
+            const comfyui_id_b = resB.prompt_id || '';
 
             await prisma.rlhfPair.update({
               where: { id: pair.id },
