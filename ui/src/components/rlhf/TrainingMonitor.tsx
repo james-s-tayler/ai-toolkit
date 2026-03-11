@@ -18,8 +18,10 @@ export default function TrainingMonitor({ sessionId, onStatusChange }: Props) {
     try {
       const res = await apiClient.get(`/api/rlhf/${sessionId}/train`);
       setRuns(res.data.runs);
-      // Only set the initial selected run; use functional update to avoid dependency on selectedRun
-      setSelectedRun(prev => (prev === null && res.data.runs.length > 0 ? res.data.runs[0] : prev));
+      // Always select the latest run (index 0, sorted desc by created_at)
+      if (res.data.runs.length > 0) {
+        setSelectedRun(prev => prev === null ? res.data.runs[0] : prev);
+      }
     } catch (e) {
       console.error('Error fetching runs:', e);
     } finally {
@@ -64,21 +66,6 @@ export default function TrainingMonitor({ sessionId, onStatusChange }: Props) {
 
   return (
     <div className="space-y-4">
-      {/* Run selector */}
-      {runs.length > 1 && (
-        <div className="flex gap-2 overflow-x-auto">
-          {runs.map((r, i) => (
-            <button
-              key={r.id}
-              onClick={() => setSelectedRun(r)}
-              className={`text-sm px-3 py-1 rounded-md whitespace-nowrap ${r.id === run.id ? 'bg-gray-700 text-white' : 'bg-gray-900 text-gray-400 hover:bg-gray-800'}`}
-            >
-              Run {runs.length - i}
-            </button>
-          ))}
-        </div>
-      )}
-
       {/* Status card */}
       <div className="bg-gray-900 rounded-lg p-4 space-y-3">
         <div className="flex justify-between">
@@ -102,9 +89,6 @@ export default function TrainingMonitor({ sessionId, onStatusChange }: Props) {
 
         {run.output_path && (
           <p className="text-xs text-gray-600 truncate">Output: {run.output_path}</p>
-        )}
-        {run.log_path && (
-          <p className="text-xs text-gray-600 truncate">Log: {run.log_path}</p>
         )}
       </div>
     </div>

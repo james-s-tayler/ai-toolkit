@@ -1,16 +1,20 @@
 'use client';
 
-import { useState, useEffect, useCallback, use } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef, use } from 'react';
 import { useRouter } from 'next/navigation';
 import { TopBar, MainContent } from '@/components/layout';
 import { Button } from '@headlessui/react';
 import { FaChevronLeft } from 'react-icons/fa';
 import { apiClient } from '@/utils/api';
-import { RlhfSession } from '@prisma/client';
+import { RlhfSession, RlhfTrainingRun } from '@prisma/client';
 import GenerationMonitor from '@/components/rlhf/GenerationMonitor';
 import EvaluationUI from '@/components/rlhf/EvaluationUI';
 import TrainingConfig from '@/components/rlhf/TrainingConfig';
 import TrainingMonitor from '@/components/rlhf/TrainingMonitor';
+import GPUWidget from '@/components/GPUWidget';
+import CPUWidget from '@/components/CPUWidget';
+import useGPUInfo from '@/hooks/useGPUInfo';
+import useCPUInfo from '@/hooks/useCPUInfo';
 
 type TabKey = 'generation' | 'evaluation' | 'training' | 'pairs';
 
@@ -31,6 +35,10 @@ interface RlhfPair {
   created_at: string;
 }
 
+const clean = (text: string): string => {
+  return text.replace(/\x1B\[A/g, '');
+};
+
 export default function SessionPage({ params }: { params: { sessionId: string } }) {
   const usableParams = use(params as any) as { sessionId: string };
   const sessionId = usableParams.sessionId;
@@ -46,6 +54,20 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
   const [pairsFilter, setPairsFilter] = useState('');
   const [prefFilter, setPrefFilter] = useState('');
   const [isLoadingPairs, setIsLoadingPairs] = useState(false);
+
+  // Training log state
+  const [trainingLog, setTrainingLog] = useState('');
+  const [latestRunId, setLatestRunId] = useState<string | null>(null);
+  const logRef = useRef<HTMLDivElement>(null);
+  const [isScrolledToBottom, setIsScrolledToBottom] = useState(true);
+
+  // GPU/CPU monitoring
+  const gpuIds = useMemo(() => {
+    if (!session?.gpu_ids) return null;
+    return session.gpu_ids.split(',').map(id => parseInt(id));
+  }, [session?.gpu_ids]);
+  const { gpuList, isGPUInfoLoaded } = useGPUInfo(gpuIds, tab === 'training' ? 5000 : null);
+  const { cpuInfo, isCPUInfoLoaded } = useCPUInfo(tab === 'training' ? 5000 : null);
 
   const fetchSession = useCallback(async () => {
     try {
@@ -81,16 +103,67 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
     }
   }, [sessionId]);
 
+  // Fetch latest run ID for log polling
+  const fetchLatestRun = useCallback(async () => {
+    try {
+      const res = await apiClient.get(`/api/rlhf/${sessionId}/train`);
+      const runs: RlhfTrainingRun[] = res.data.runs;
+      if (runs.length > 0) {
+        setLatestRunId(runs[0].id);
+      }
+    } catch (e) {
+      // ignore
+    }
+  }, [sessionId]);
+
+  // Fetch training log
+  const fetchLog = useCallback(async () => {
+    if (!latestRunId) return;
+    try {
+      const res = await apiClient.get(`/api/rlhf/${sessionId}/train/${latestRunId}/log`);
+      if (res.data.log) {
+        setTrainingLog(clean(res.data.log));
+      }
+    } catch (e) {
+      // ignore
+    }
+  }, [sessionId, latestRunId]);
+
   useEffect(() => { fetchSession(); fetchEvaluatedCount(); }, [fetchSession, fetchEvaluatedCount]);
 
   // Re-fetch evaluated count when switching to training tab so it's always current
   useEffect(() => {
-    if (tab === 'training') fetchEvaluatedCount();
-  }, [tab, fetchEvaluatedCount]);
+    if (tab === 'training') {
+      fetchEvaluatedCount();
+      fetchLatestRun();
+    }
+  }, [tab, fetchEvaluatedCount, fetchLatestRun]);
+
+  // Poll training log every 2s when on training tab
+  useEffect(() => {
+    if (tab !== 'training' || !latestRunId) return;
+    fetchLog();
+    const timer = setInterval(fetchLog, 2000);
+    return () => clearInterval(timer);
+  }, [tab, latestRunId, fetchLog]);
 
   useEffect(() => {
     if (tab === 'pairs') fetchPairs(pairsPage, pairsFilter, prefFilter);
   }, [tab, pairsPage, pairsFilter, prefFilter, fetchPairs]);
+
+  // Auto-scroll log to bottom
+  useEffect(() => {
+    if (logRef.current && isScrolledToBottom) {
+      logRef.current.scrollTop = logRef.current.scrollHeight;
+    }
+  }, [trainingLog, isScrolledToBottom]);
+
+  const handleLogScroll = () => {
+    if (logRef.current) {
+      const { scrollTop, scrollHeight, clientHeight } = logRef.current;
+      setIsScrolledToBottom(scrollHeight - scrollTop - clientHeight < 10);
+    }
+  };
 
   const handleStartTraining = async (params: any) => {
     setIsTrainingStarting(true);
@@ -98,6 +171,7 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
     try {
       await apiClient.post(`/api/rlhf/${sessionId}/train`, params);
       await fetchSession();
+      await fetchLatestRun();
       setTab('training');
     } catch (e: any) {
       setTrainingError(e?.response?.data?.error || 'Failed to start training');
@@ -106,7 +180,17 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
     }
   };
 
-  const prefLabels: Record<string, string> = { none: '—', a: 'A', b: 'B', tie: 'Tie', skip: 'Skip' };
+  const logLines = useMemo(() => {
+    let splits = trainingLog.split(/\n|\r\n/);
+    splits = splits.map(line => line.split(/\r/).pop()) as string[];
+    const maxLines = 1000;
+    if (splits.length > maxLines) {
+      splits = splits.slice(splits.length - maxLines);
+    }
+    return splits;
+  }, [trainingLog]);
+
+  const prefLabels: Record<string, string> = { none: '\u2014', a: 'A', b: 'B', tie: 'Tie', skip: 'Skip' };
   const prefColors: Record<string, string> = {
     none: 'text-gray-500', a: 'text-green-400', b: 'text-blue-400', tie: 'text-yellow-400', skip: 'text-gray-500'
   };
@@ -158,16 +242,50 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
             )}
 
             {tab === 'training' && (
-              <div className="space-y-6">
-                {(session.status === 'training' || session.status === 'completed') && (
-                  <TrainingMonitor sessionId={sessionId} onStatusChange={fetchSession} />
-                )}
-                <TrainingConfig
-                  onStart={handleStartTraining}
-                  isStarting={isTrainingStarting}
-                  error={trainingError}
-                  evaluatedCount={evaluatedCount}
-                />
+              <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
+                {/* Left 2 columns: training status + console log + config */}
+                <div className="col-span-2 space-y-6">
+                  {(session.status === 'training' || session.status === 'completed') && (
+                    <TrainingMonitor sessionId={sessionId} onStatusChange={fetchSession} />
+                  )}
+
+                  {/* Console log */}
+                  {latestRunId && (
+                    <div className="bg-gray-900 rounded-xl shadow-lg overflow-hidden border border-gray-800">
+                      <div className="bg-gray-800 px-4 py-2">
+                        <h3 className="text-sm text-gray-300">Console Output</h3>
+                      </div>
+                      <div className="relative min-h-60 h-80">
+                        <div
+                          ref={logRef}
+                          className="text-xs text-gray-300 absolute inset-0 p-4 overflow-y-auto"
+                          onScroll={handleLogScroll}
+                        >
+                          <div>
+                            {logLines.map((line, index) => (
+                              <pre key={index}>{line}</pre>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  <TrainingConfig
+                    onStart={handleStartTraining}
+                    isStarting={isTrainingStarting}
+                    error={trainingError}
+                    evaluatedCount={evaluatedCount}
+                  />
+                </div>
+
+                {/* Right column: CPU + GPU widgets */}
+                <div className="col-span-1">
+                  <div>{isCPUInfoLoaded && cpuInfo && <CPUWidget cpu={cpuInfo} />}</div>
+                  <div className="mt-4">
+                    {isGPUInfoLoaded && gpuList.length > 0 && <GPUWidget gpu={gpuList[0]} />}
+                  </div>
+                </div>
               </div>
             )}
 
@@ -250,7 +368,7 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
                       onClick={() => setPairsPage(p => p - 1)}
                       className="text-gray-400 hover:text-gray-200 px-3 py-1 disabled:opacity-40"
                     >
-                      ← Prev
+                      &larr; Prev
                     </button>
                     <span className="text-gray-500 text-sm">Page {pairsPage} of {Math.ceil(pairsTotal / 50)}</span>
                     <button
@@ -258,7 +376,7 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
                       onClick={() => setPairsPage(p => p + 1)}
                       className="text-gray-400 hover:text-gray-200 px-3 py-1 disabled:opacity-40"
                     >
-                      Next →
+                      Next &rarr;
                     </button>
                   </div>
                 )}
