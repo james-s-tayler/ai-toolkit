@@ -6,9 +6,10 @@ import { apiClient } from '@/utils/api';
 interface FileObject {
   path: string;
   size: number;
+  name?: string;
 }
 
-export default function useFilesList(jobID: string, reloadInterval: null | number = null) {
+export default function useFilesList(apiUrl: string, reloadInterval: null | number = null) {
   const [files, setFiles] = useState<FileObject[]>([]);
   const didInitialLoadRef = useRef(false);
   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error' | 'refreshing'>('idle');
@@ -20,7 +21,7 @@ export default function useFilesList(jobID: string, reloadInterval: null | numbe
     }
     setStatus(loadStatus);
     apiClient
-      .get(`/api/jobs/${jobID}/files`)
+      .get(apiUrl)
       .then(res => res.data)
       .then(data => {
         console.log('Fetched files:', data);
@@ -48,7 +49,7 @@ export default function useFilesList(jobID: string, reloadInterval: null | numbe
         clearInterval(interval);
       };
     }
-  }, [jobID]);
+  }, [apiUrl]);
 
   return { files, setFiles, status, refreshFiles };
 }

@@ -9,24 +9,33 @@ import { apiClient } from '@/utils/api';
 import { RlhfSession, RlhfTrainingRun } from '@prisma/client';
 import GenerationMonitor from '@/components/rlhf/GenerationMonitor';
 import EvaluationUI from '@/components/rlhf/EvaluationUI';
-import TrainingConfig from '@/components/rlhf/TrainingConfig';
+import TrainingConfig, { TrainingParams, DEFAULT_TRAINING_PARAMS } from '@/components/rlhf/TrainingConfig';
 import TrainingMonitor from '@/components/rlhf/TrainingMonitor';
+import RlhfActionBar from '@/components/rlhf/RlhfActionBar';
+import RlhfLossGraph from '@/components/rlhf/RlhfLossGraph';
+import RlhfConfigViewer from '@/components/rlhf/RlhfConfigViewer';
 import GPUWidget from '@/components/GPUWidget';
 import CPUWidget from '@/components/CPUWidget';
+import FilesWidget from '@/components/FilesWidget';
 import useGPUInfo from '@/hooks/useGPUInfo';
 import useCPUInfo from '@/hooks/useCPUInfo';
 
-type TabKey = 'generation' | 'evaluation' | 'training' | 'pairs';
+type TabKey = 'generation' | 'evaluation' | 'config' | 'training' | 'loss_graph' | 'pairs';
 
 const allTabs: { key: TabKey; label: string }[] = [
   { key: 'generation', label: 'Generation' },
   { key: 'evaluation', label: 'Evaluation' },
+  { key: 'config', label: 'Config' },
   { key: 'training', label: 'Training' },
+  { key: 'loss_graph', label: 'Loss Graph' },
   { key: 'pairs', label: 'Pairs' },
 ];
 
 const importTabs: { key: TabKey; label: string }[] = [
+  { key: 'evaluation', label: 'Evaluation' },
+  { key: 'config', label: 'Config' },
   { key: 'training', label: 'Training' },
+  { key: 'loss_graph', label: 'Loss Graph' },
   { key: 'pairs', label: 'Pairs' },
 ];
 
@@ -51,8 +60,6 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
   const [session, setSession] = useState<RlhfSession | null>(null);
   const [tab, setTab] = useState<TabKey>('generation');
   const [initialTabSet, setInitialTabSet] = useState(false);
-  const [isTrainingStarting, setIsTrainingStarting] = useState(false);
-  const [trainingError, setTrainingError] = useState('');
   const [evaluatedCount, setEvaluatedCount] = useState(0);
   const [pairs, setPairs] = useState<RlhfPair[]>([]);
   const [pairsTotal, setPairsTotal] = useState(0);
@@ -60,10 +67,16 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
   const [pairsFilter, setPairsFilter] = useState('');
   const [prefFilter, setPrefFilter] = useState('');
   const [isLoadingPairs, setIsLoadingPairs] = useState(false);
+  const [evalPairId, setEvalPairId] = useState<string | null>(null);
+
+  // Config state
+  const [savedConfig, setSavedConfig] = useState<TrainingParams | null>(null);
+  const [isSavingConfig, setIsSavingConfig] = useState(false);
 
   // Training log state
   const [trainingLog, setTrainingLog] = useState('');
   const [latestRunId, setLatestRunId] = useState<string | null>(null);
+  const [latestRunStatus, setLatestRunStatus] = useState<string | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
   const [isScrolledToBottom, setIsScrolledToBottom] = useState(true);
 
@@ -79,6 +92,17 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
     try {
       const res = await apiClient.get(`/api/rlhf/${sessionId}`);
       setSession(res.data);
+      // Load saved config from session
+      if (res.data.config_json) {
+        try {
+          const cfg = JSON.parse(res.data.config_json);
+          if (cfg.training_params) {
+            setSavedConfig(cfg.training_params);
+          }
+        } catch {
+          // ignore parse errors
+        }
+      }
     } catch (e) {
       console.error('Error fetching session:', e);
     }
@@ -116,11 +140,26 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
       const runs: RlhfTrainingRun[] = res.data.runs;
       if (runs.length > 0) {
         setLatestRunId(runs[0].id);
+        setLatestRunStatus(runs[0].status);
+      } else {
+        setLatestRunId(null);
+        setLatestRunStatus(null);
       }
     } catch (e) {
       // ignore
     }
   }, [sessionId]);
+
+  // Fetch run status (for action bar refresh)
+  const fetchRunStatus = useCallback(async () => {
+    if (!latestRunId) return;
+    try {
+      const res = await apiClient.get(`/api/rlhf/${sessionId}/train/${latestRunId}`);
+      setLatestRunStatus(res.data.status);
+    } catch (e) {
+      // ignore
+    }
+  }, [sessionId, latestRunId]);
 
   // Fetch training log
   const fetchLog = useCallback(async () => {
@@ -142,17 +181,17 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
   useEffect(() => {
     if (session && !initialTabSet) {
       if ((session as any).dataset_mode === 'import') {
-        setTab('training');
+        setTab('config');
       }
       setInitialTabSet(true);
     }
   }, [session, initialTabSet]);
 
-  useEffect(() => { fetchSession(); fetchEvaluatedCount(); }, [fetchSession, fetchEvaluatedCount]);
+  useEffect(() => { fetchSession(); fetchEvaluatedCount(); fetchLatestRun(); }, [fetchSession, fetchEvaluatedCount, fetchLatestRun]);
 
-  // Re-fetch evaluated count when switching to training tab so it's always current
+  // Re-fetch evaluated count and latest run when switching to config or training tab
   useEffect(() => {
-    if (tab === 'training') {
+    if (tab === 'config' || tab === 'training' || tab === 'loss_graph') {
       fetchEvaluatedCount();
       fetchLatestRun();
     }
@@ -165,6 +204,14 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
     const timer = setInterval(fetchLog, 2000);
     return () => clearInterval(timer);
   }, [tab, latestRunId, fetchLog]);
+
+  // Poll run status every 3s when run is active (action bar is always visible)
+  useEffect(() => {
+    if (!latestRunId) return;
+    if (latestRunStatus !== 'running' && latestRunStatus !== 'paused' && latestRunStatus !== 'pending') return;
+    const timer = setInterval(fetchRunStatus, 3000);
+    return () => clearInterval(timer);
+  }, [latestRunId, latestRunStatus, fetchRunStatus]);
 
   useEffect(() => {
     if (tab === 'pairs') fetchPairs(pairsPage, pairsFilter, prefFilter);
@@ -184,19 +231,47 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
     }
   };
 
-  const handleStartTraining = async (params: any) => {
-    setIsTrainingStarting(true);
-    setTrainingError('');
+  const handleStartTraining = async (params: TrainingParams) => {
+    setIsSavingConfig(true);
     try {
+      // Save config first
+      let existingConfig: Record<string, any> = {};
+      if ((session as any)?.config_json) {
+        try { existingConfig = JSON.parse((session as any).config_json); } catch { /* ignore */ }
+      }
+      const newConfig = { ...existingConfig, training_params: params };
+      await apiClient.put(`/api/rlhf/${sessionId}`, { config_json: JSON.stringify(newConfig) });
+      setSavedConfig(params);
+
+      // Start training
       await apiClient.post(`/api/rlhf/${sessionId}/train`, params);
       await fetchSession();
       await fetchLatestRun();
       setTab('training');
-    } catch (e: any) {
-      setTrainingError(e?.response?.data?.error || 'Failed to start training');
+    } catch (e) {
+      console.error('Error starting training:', e);
     } finally {
-      setIsTrainingStarting(false);
+      setIsSavingConfig(false);
     }
+  };
+
+  const handleTrainingStarted = async () => {
+    await fetchSession();
+    await fetchLatestRun();
+    setTab('training');
+  };
+
+  const handleActionComplete = async () => {
+    await fetchRunStatus();
+    await fetchLatestRun();
+    await fetchSession();
+  };
+
+  const handleRunDeleted = async () => {
+    setTrainingLog('');
+    await fetchLatestRun();
+    await fetchSession();
+    setTab('config');
   };
 
   const logLines = useMemo(() => {
@@ -208,6 +283,8 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
     }
     return splits;
   }, [trainingLog]);
+
+  const isTraining = latestRunStatus === 'running' || latestRunStatus === 'paused';
 
   const prefLabels: Record<string, string> = { none: '\u2014', a: 'A', b: 'B', tie: 'Tie', skip: 'Skip' };
   const prefColors: Record<string, string> = {
@@ -229,6 +306,19 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
             {session && <span className="ml-3 text-sm text-gray-500">{session.status}</span>}
           </h1>
         </div>
+        <div className="flex-1"></div>
+        {session && (
+          <RlhfActionBar
+            sessionId={sessionId}
+            latestRunId={latestRunId}
+            runStatus={latestRunStatus}
+            savedConfig={savedConfig}
+            evaluatedCount={evaluatedCount}
+            onTrainingStarted={handleTrainingStarted}
+            onActionComplete={handleActionComplete}
+            onRunDeleted={handleRunDeleted}
+          />
+        )}
       </TopBar>
 
       {/* Tab bar */}
@@ -236,7 +326,7 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
         {tabs.map(t => (
           <Button
             key={t.key}
-            onClick={() => setTab(t.key)}
+            onClick={() => { if (t.key === 'evaluation') setEvalPairId(null); setTab(t.key); }}
             className={`px-4 py-1 h-8 ${t.key === tab ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-gray-200'}`}
           >
             {t.label}
@@ -257,43 +347,16 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
             )}
 
             {tab === 'evaluation' && (
-              <EvaluationUI sessionId={sessionId} sessionStatus={session.status} />
+              <EvaluationUI key={evalPairId ?? 'default'} sessionId={sessionId} sessionStatus={session.status} initialPairId={evalPairId} />
             )}
 
-            {tab === 'training' && (
-              <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
-                {/* Left 2 columns: training status + console log + config */}
-                <div className="col-span-2 space-y-6">
-                  {(session.status === 'training' || session.status === 'completed') && (
-                    <TrainingMonitor sessionId={sessionId} onStatusChange={fetchSession} />
-                  )}
-
-                  {/* Console log */}
-                  {latestRunId && (
-                    <div className="bg-gray-900 rounded-xl shadow-lg overflow-hidden border border-gray-800">
-                      <div className="bg-gray-800 px-4 py-2">
-                        <h3 className="text-sm text-gray-300">Console Output</h3>
-                      </div>
-                      <div className="relative min-h-60 h-80">
-                        <div
-                          ref={logRef}
-                          className="text-xs text-gray-300 absolute inset-0 p-4 overflow-y-auto"
-                          onScroll={handleLogScroll}
-                        >
-                          <div>
-                            {logLines.map((line, index) => (
-                              <pre key={index}>{line}</pre>
-                            ))}
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  )}
-
+            {tab === 'config' && (
+              <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
+                <div>
                   {isImportMode && (() => {
                     const cfg = JSON.parse((session as any).config_json || '{}');
                     return cfg.accepted_dataset ? (
-                      <div className="bg-gray-900 rounded-xl shadow-lg overflow-hidden border border-gray-800 p-4">
+                      <div className="bg-gray-900 rounded-xl shadow-lg overflow-hidden border border-gray-800 p-4 mb-6">
                         <h3 className="text-sm text-teal-400 mb-2">Imported Datasets</h3>
                         <div className="text-sm text-gray-300 space-y-1">
                           <p>Accepted: <span className="text-green-400">{cfg.accepted_dataset}</span></p>
@@ -311,21 +374,69 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
                   })()}
 
                   <TrainingConfig
-                    onStart={handleStartTraining}
-                    isStarting={isTrainingStarting}
-                    error={trainingError}
+                    onStartTraining={handleStartTraining}
+                    initialConfig={savedConfig}
                     evaluatedCount={evaluatedCount}
+                    isStarting={isSavingConfig}
+                    disabled={isTraining}
                   />
                 </div>
 
-                {/* Right column: CPU + GPU widgets */}
-                <div className="col-span-1">
-                  <div>{isCPUInfoLoaded && cpuInfo && <CPUWidget cpu={cpuInfo} />}</div>
-                  <div className="mt-4">
-                    {isGPUInfoLoaded && gpuList.length > 0 && <GPUWidget gpu={gpuList[0]} />}
+                <RlhfConfigViewer config={savedConfig ?? DEFAULT_TRAINING_PARAMS} />
+              </div>
+            )}
+
+            {tab === 'training' && (
+              <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
+                {/* Left 2 columns: status + console log */}
+                <div className="col-span-2 space-y-6">
+                  {latestRunId && (
+                    <TrainingMonitor sessionId={sessionId} onStatusChange={fetchSession} />
+                  )}
+
+                  {/* Console log */}
+                  <div className="bg-gray-900 rounded-xl shadow-lg overflow-hidden border border-gray-800">
+                    <div className="bg-gray-800 px-4 py-2">
+                      <h3 className="text-sm text-gray-300">Console Output</h3>
+                    </div>
+                    <div className="relative min-h-60 h-80">
+                      <div
+                        ref={logRef}
+                        className="text-xs text-gray-300 absolute inset-0 p-4 overflow-y-auto"
+                        onScroll={handleLogScroll}
+                      >
+                        {!latestRunId && (
+                          <span className="text-gray-600">No training runs yet.</span>
+                        )}
+                        {latestRunId && (
+                          <div>
+                            {logLines.map((line, index) => (
+                              <pre key={index}>{line}</pre>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
                   </div>
                 </div>
+
+                {/* Right column: CPU + GPU widgets + Checkpoints */}
+                <div className="col-span-1 space-y-4">
+                  <div>{isCPUInfoLoaded && cpuInfo && <CPUWidget cpu={cpuInfo} />}</div>
+                  <div>
+                    {isGPUInfoLoaded && gpuList.length > 0 && <GPUWidget gpu={gpuList[0]} />}
+                  </div>
+                  <FilesWidget apiUrl={`/api/rlhf/${sessionId}/files`} />
+                </div>
               </div>
+            )}
+
+            {tab === 'loss_graph' && (
+              <RlhfLossGraph
+                sessionId={sessionId}
+                runId={latestRunId}
+                isTraining={isTraining}
+              />
             )}
 
             {tab === 'pairs' && (
@@ -369,7 +480,11 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
                 {/* Pairs grid */}
                 <div className="grid grid-cols-1 gap-2">
                   {pairs.map(pair => (
-                    <div key={pair.id} className="bg-gray-900 rounded-lg p-3 flex gap-4 items-start">
+                    <div
+                      key={pair.id}
+                      className="bg-gray-900 rounded-lg p-3 flex gap-4 items-start cursor-pointer hover:bg-gray-800 transition-colors"
+                      onClick={() => { setEvalPairId(pair.id); setTab('evaluation'); }}
+                    >
                       {/* Thumbnail pair */}
                       <div className="flex gap-2 flex-shrink-0">
                         {pair.image_a_path ? (

@@ -21,11 +21,12 @@ Input preferences.json:
         ...
     ]
 
-Output status.json (written every 10 steps):
+Output status.json (written every step):
     {"step": 150, "total_steps": 2000, "loss": 0.693, "status": "running"}
 """
 
 import argparse
+import gc
 import hashlib
 import json
 import math
@@ -33,11 +34,13 @@ import os
 import random
 import re
 import sys
+import time
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from safetensors.torch import save_file as safetensors_save_file
 from torchvision import transforms
 
 
@@ -66,6 +69,8 @@ def parse_args():
     parser.add_argument("--model_path", type=str, required=True,
                         help="Local path or HuggingFace repo ID (e.g. Tongyi-MAI/Z-Image)")
     parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--cache_dir", type=str, default="",
+                        help="Directory for latent/embedding caches (persists across runs)")
     parser.add_argument("--status_file", type=str, required=True)
     parser.add_argument("--run_id", type=str, default="")
     parser.add_argument("--beta", type=float, default=5000.0)
@@ -73,13 +78,15 @@ def parse_args():
     parser.add_argument("--max_train_steps", type=int, default=2000)
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--blocks_to_swap", type=int, default=0)
+    parser.add_argument("--blocks_to_swap", type=int, default=16)
     parser.add_argument("--mixed_precision", type=str, default="bf16",
                         choices=["no", "fp16", "bf16"])
     parser.add_argument("--gradient_checkpointing", action="store_true")
-    parser.add_argument("--save_every", type=int, default=500)
+    parser.add_argument("--save_every", type=int, default=250)
     parser.add_argument("--status_every", type=int, default=10)
     parser.add_argument("--resolution", type=int, default=1024)
+    parser.add_argument("--control_file", type=str, default="",
+                        help="Path to control.json for pause/resume/stop signalling")
     return parser.parse_args()
 
 
@@ -87,12 +94,57 @@ def parse_args():
 # Status file helpers
 # ---------------------------------------------------------------------------
 
-def write_status(path: str, step: int, total_steps: int, loss: float, status: str = "running"):
+def write_status(path: str, step: int, total_steps: int, loss: float, status: str = "running", speed_string: str = ""):
     try:
+        data = {"step": step, "total_steps": total_steps, "loss": loss, "status": status}
+        if speed_string:
+            data["speed_string"] = speed_string
         with open(path, "w") as f:
-            json.dump({"step": step, "total_steps": total_steps, "loss": loss, "status": status}, f)
+            json.dump(data, f)
     except Exception as e:
         print(f"[rlhf] Warning: could not write status file: {e}", file=sys.stderr)
+
+
+def append_loss_log(output_dir: str, step: int, loss: float):
+    """Append a loss point to loss_log.jsonl for the loss graph UI."""
+    try:
+        log_path = os.path.join(output_dir, "loss_log.jsonl")
+        with open(log_path, "a") as f:
+            f.write(json.dumps({"step": step, "loss": loss}) + "\n")
+    except Exception as e:
+        print(f"[rlhf] Warning: could not write loss log: {e}", file=sys.stderr)
+
+
+def save_lora_weights(lora_network, ckpt_dir: str, dtype):
+    """Save only the LoRA weights (not the frozen base model weights) as safetensors."""
+    if hasattr(lora_network, 'save_weights'):
+        save_path = os.path.join(ckpt_dir, "lora_weights.safetensors")
+        lora_network.save_weights(save_path, dtype=dtype)
+    else:
+        # Fallback SimpleLoRANetwork: extract only lora_down/lora_up params
+        state_dict = {}
+        for i, mod in enumerate(lora_network.lora_modules):
+            state_dict[f"lora_modules.{i}.lora_down.weight"] = mod.lora_down.weight.data.to(dtype)
+            state_dict[f"lora_modules.{i}.lora_up.weight"] = mod.lora_up.weight.data.to(dtype)
+        save_path = os.path.join(ckpt_dir, "lora_weights.safetensors")
+        safetensors_save_file(state_dict, save_path)
+
+
+def check_control(control_file: str) -> str:
+    """Read control.json and return the action: 'run', 'pause', 'resume', or 'stop'.
+
+    Returns 'run' if file doesn't exist or can't be read.
+    """
+    if not control_file:
+        return "run"
+    try:
+        if not os.path.exists(control_file):
+            return "run"
+        with open(control_file, "r") as f:
+            data = json.load(f)
+        return data.get("action", "run")
+    except Exception:
+        return "run"
 
 
 # ---------------------------------------------------------------------------
@@ -107,9 +159,19 @@ def resolve_model_path(model_path: str) -> str:
 
     # Check if it looks like a HuggingFace repo ID (org/model)
     if "/" in model_path and not os.path.exists(model_path):
+        from huggingface_hub import snapshot_download
+
+        # Try local HF cache first (no network call)
+        try:
+            local_path = snapshot_download(model_path, local_files_only=True)
+            print(f"[rlhf] Using cached model: {local_path}")
+            return local_path
+        except Exception:
+            pass
+
+        # Not in cache, download from HuggingFace
         print(f"[rlhf] Model path '{model_path}' not found locally, downloading from HuggingFace...")
         try:
-            from huggingface_hub import snapshot_download
             local_path = snapshot_download(model_path)
             print(f"[rlhf] Downloaded to: {local_path}")
             return local_path
@@ -263,6 +325,60 @@ def create_lora_network(transformer, lora_rank: int, lora_alpha: float = None):
 
 
 # ---------------------------------------------------------------------------
+# Cache pre-check helpers
+# ---------------------------------------------------------------------------
+
+def all_latents_cached(image_paths, cache_dir):
+    """Check if all image latents are already cached on disk."""
+    cache_dir = Path(cache_dir)
+    if not cache_dir.exists():
+        return False
+    for img_path in set(image_paths):
+        path_hash = hashlib.sha256(img_path.encode()).hexdigest()[:12]
+        if not (cache_dir / f"lat_{path_hash}.pt").exists():
+            return False
+    return True
+
+
+def all_embeddings_cached(prompts, cache_dir):
+    """Check if all prompt embeddings are already cached on disk."""
+    cache_dir = Path(cache_dir)
+    if not cache_dir.exists():
+        return False
+    for prompt in set(prompts):
+        prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:12]
+        if not (cache_dir / f"emb_{prompt_hash}.pt").exists():
+            return False
+    return True
+
+
+def load_latents_from_cache(image_paths, cache_dir):
+    """Load all latents from disk cache without needing the VAE."""
+    cache_dir = Path(cache_dir)
+    latents = {}
+    unique_paths = list(dict.fromkeys(image_paths))
+    for i, img_path in enumerate(unique_paths, 1):
+        path_hash = hashlib.sha256(img_path.encode()).hexdigest()[:12]
+        cache_path = cache_dir / f"lat_{path_hash}.pt"
+        latents[img_path] = torch.load(cache_path, map_location="cpu", weights_only=True)
+        print(f"[rlhf]   latent {i}/{len(unique_paths)} (cached) {os.path.basename(img_path)}")
+    return latents
+
+
+def load_embeddings_from_cache(prompts, cache_dir):
+    """Load all embeddings from disk cache without needing the text encoder."""
+    cache_dir = Path(cache_dir)
+    embeddings = {}
+    unique_prompts = list(dict.fromkeys(prompts))
+    for i, prompt in enumerate(unique_prompts, 1):
+        prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:12]
+        cache_path = cache_dir / f"emb_{prompt_hash}.pt"
+        embeddings[prompt] = torch.load(cache_path, map_location="cpu", weights_only=True)
+        print(f"[rlhf]   embedding {i}/{len(unique_prompts)} (cached) {prompt[:60]}")
+    return embeddings
+
+
+# ---------------------------------------------------------------------------
 # VAE latent caching — Z-Image uses different scaling
 # ---------------------------------------------------------------------------
 
@@ -274,15 +390,19 @@ def encode_images_to_latents(vae, image_paths, resolution, device, cache_dir):
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     latents = {}
+    unique_paths = list(dict.fromkeys(image_paths))  # deduplicate, preserve order
+    total = len(unique_paths)
 
-    for img_path in image_paths:
+    for i, img_path in enumerate(unique_paths, 1):
         # Use full path hash for cache key to handle duplicate filenames
         path_hash = hashlib.sha256(img_path.encode()).hexdigest()[:12]
         cache_path = cache_dir / f"lat_{path_hash}.pt"
         if cache_path.exists():
             latents[img_path] = torch.load(cache_path, map_location="cpu", weights_only=True)
+            print(f"[rlhf]   latent {i}/{total} (cached) {os.path.basename(img_path)}")
             continue
 
+        print(f"[rlhf]   latent {i}/{total} encoding {os.path.basename(img_path)}")
         img_tensor = load_and_preprocess_image(img_path, resolution).to(device, dtype=torch.float32)
         with torch.no_grad():
             # Z-Image VAE expects float32 input
@@ -314,14 +434,18 @@ def encode_prompts(tokenizer, text_encoder, prompts, device, cache_dir):
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     embeddings = {}
+    unique_prompts = list(dict.fromkeys(prompts))  # deduplicate, preserve order
+    total = len(unique_prompts)
 
-    for prompt in set(prompts):
+    for i, prompt in enumerate(unique_prompts, 1):
         prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:12]
         cache_path = cache_dir / f"emb_{prompt_hash}.pt"
         if cache_path.exists():
             embeddings[prompt] = torch.load(cache_path, map_location="cpu", weights_only=True)
+            print(f"[rlhf]   embedding {i}/{total} (cached) {prompt[:60]}")
             continue
 
+        print(f"[rlhf]   embedding {i}/{total} encoding {prompt[:60]}")
         # Apply chat template (required for Qwen3)
         messages = [{"role": "user", "content": prompt}]
         formatted = tokenizer.apply_chat_template(
@@ -460,12 +584,87 @@ def compute_dpo_loss(
 # Main training loop
 # ---------------------------------------------------------------------------
 
+def format_bytes(n: int) -> str:
+    """Format byte count to human-readable string."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def format_duration(seconds: float) -> str:
+    """Format seconds to human-readable duration string."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    if seconds < 3600:
+        m, s = divmod(seconds, 60)
+        return f"{int(m)}m {int(s)}s"
+    h, remainder = divmod(seconds, 3600)
+    m, s = divmod(remainder, 60)
+    return f"{int(h)}h {int(m)}m {int(s)}s"
+
+
+def log_vram(label: str = ""):
+    """Log current GPU VRAM usage."""
+    if not torch.cuda.is_available():
+        return
+    allocated = torch.cuda.memory_allocated()
+    reserved = torch.cuda.memory_reserved()
+    total = torch.cuda.get_device_properties(0).total_memory
+    suffix = f" [{label}]" if label else ""
+    print(f"[rlhf]   VRAM: {format_bytes(allocated)} allocated, "
+          f"{format_bytes(reserved)} reserved, "
+          f"{format_bytes(total)} total{suffix}")
+
+
+def log_gpu_info():
+    """Log GPU hardware details."""
+    if not torch.cuda.is_available():
+        print("[rlhf] CUDA not available — running on CPU")
+        return
+    for i in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(i)
+        print(f"[rlhf]   GPU {i}: {props.name}  "
+              f"{format_bytes(props.total_memory)} VRAM  "
+              f"compute={props.major}.{props.minor}  "
+              f"SMs={props.multi_processor_count}")
+
+
 def main():
+    train_start_time = time.time()
     args = parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     write_status(args.status_file, 0, args.max_train_steps, 0.0, "starting")
 
+    # -------------------------------------------------------------------
+    # Configuration dump
+    # -------------------------------------------------------------------
+    print("=" * 70)
+    print("  RLHF-DPO Training for Z-Image")
+    print("=" * 70)
+    print(f"[rlhf] Training configuration:")
+    print(f"[rlhf]   model_path        = {args.model_path}")
+    print(f"[rlhf]   output_dir        = {args.output_dir}")
+    print(f"[rlhf]   preference_data   = {args.preference_data}")
+    print(f"[rlhf]   run_id            = {args.run_id or '(none)'}")
+    print(f"[rlhf]   beta              = {args.beta}")
+    print(f"[rlhf]   learning_rate     = {args.learning_rate:.2e}")
+    print(f"[rlhf]   max_train_steps   = {args.max_train_steps}")
+    print(f"[rlhf]   lora_rank         = {args.lora_rank}")
+    print(f"[rlhf]   batch_size        = {args.batch_size}")
+    print(f"[rlhf]   blocks_to_swap    = {args.blocks_to_swap}")
+    print(f"[rlhf]   save_every        = {args.save_every}")
+    print(f"[rlhf]   status_every      = {args.status_every}")
+    print(f"[rlhf]   resolution        = {args.resolution}")
+    print(f"[rlhf]   mixed_precision   = {args.mixed_precision}")
+    print(f"[rlhf]   grad_checkpointing= {args.gradient_checkpointing}")
+    print(f"[rlhf]   control_file      = {args.control_file or '(none)'}")
+
+    # -------------------------------------------------------------------
+    # Hardware info
+    # -------------------------------------------------------------------
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if args.mixed_precision == "bf16":
         dtype = torch.bfloat16
@@ -474,7 +673,18 @@ def main():
     else:
         dtype = torch.float32
 
-    print(f"[rlhf] Using device={device}, dtype={dtype}")
+    print(f"[rlhf] Hardware:")
+    print(f"[rlhf]   device            = {device}")
+    print(f"[rlhf]   dtype             = {dtype}")
+    print(f"[rlhf]   torch version     = {torch.__version__}")
+    print(f"[rlhf]   CUDA available    = {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"[rlhf]   CUDA version      = {torch.version.cuda}")
+        print(f"[rlhf]   cuDNN version     = {torch.backends.cudnn.version()}")
+        print(f"[rlhf]   GPU count         = {torch.cuda.device_count()}")
+        log_gpu_info()
+    log_vram("startup")
+    print("-" * 70)
 
     # Load preference data
     with open(args.preference_data) as f:
@@ -485,50 +695,133 @@ def main():
         write_status(args.status_file, 0, args.max_train_steps, 0.0, "error")
         sys.exit(1)
 
-    print(f"[rlhf] Loaded {len(preferences)} preference pairs")
+    unique_prompts = len(set(p["prompt"] for p in preferences))
+    print(f"[rlhf] Loaded {len(preferences)} preference pairs ({unique_prompts} unique prompts)")
 
     # -----------------------------------------------------------------------
-    # Load Z-Image model components
+    # Determine what needs loading vs what's fully cached
+    # -----------------------------------------------------------------------
+    all_image_paths = []
+    for p in preferences:
+        all_image_paths.append(p["winner_path"])
+        all_image_paths.append(p["loser_path"])
+    prompts = [p["prompt"] for p in preferences]
+    cache_dir = args.cache_dir if args.cache_dir else os.path.join(args.output_dir, "cache")
+
+    latents_fully_cached = all_latents_cached(all_image_paths, cache_dir)
+    embeddings_fully_cached = all_embeddings_cached(prompts, cache_dir)
+
+    if latents_fully_cached:
+        print(f"[rlhf] All {len(set(all_image_paths))} latents found in cache — skipping VAE load")
+    if embeddings_fully_cached:
+        print(f"[rlhf] All {len(set(prompts))} embeddings found in cache — skipping text encoder load")
+
+    # -----------------------------------------------------------------------
+    # Resolve model path (needed for all loading)
     # -----------------------------------------------------------------------
     model_path = resolve_model_path(args.model_path)
-
-    print(f"[rlhf] Loading Z-Image transformer from {model_path}")
-    write_status(args.status_file, 0, args.max_train_steps, 0.0, "loading_model")
+    print(f"[rlhf] Model path: {model_path}")
 
     try:
-        from diffusers import AutoencoderKL
         from diffusers.models.transformers import ZImageTransformer2DModel
-        from transformers import AutoTokenizer, Qwen3ForCausalLM
+        if not latents_fully_cached:
+            from diffusers import AutoencoderKL
+        if not embeddings_fully_cached:
+            from transformers import AutoTokenizer, Qwen3ForCausalLM
     except ImportError as e:
         print(f"[rlhf] ERROR: Missing dependencies. Install with: pip install diffusers transformers", file=sys.stderr)
         print(f"[rlhf]   Import error: {e}", file=sys.stderr)
         write_status(args.status_file, 0, args.max_train_steps, 0.0, "error")
         sys.exit(1)
 
+    # -----------------------------------------------------------------------
+    # Phase 1: Cache latents and embeddings BEFORE loading transformer.
+    # This way VAE and text encoder are fully unloaded (CPU + GPU) before
+    # the large transformer ever touches memory.
+    # -----------------------------------------------------------------------
+
+    # --- Latents ---
+    t0 = time.time()
+    unique_images = len(set(all_image_paths))
+    write_status(args.status_file, 0, args.max_train_steps, 0.0, "caching_latents")
+
+    if latents_fully_cached:
+        print(f"[rlhf] Loading {unique_images} latents from cache...")
+        latents_cache = load_latents_from_cache(all_image_paths, cache_dir)
+    else:
+        print(f"[rlhf] Encoding {len(all_image_paths)} images to latents ({unique_images} unique)...")
+        try:
+            vae = AutoencoderKL.from_pretrained(model_path, subfolder="vae", torch_dtype=torch.float32)
+            print(f"[rlhf]   VAE loaded (float32)")
+            vae = vae.to(device)
+            log_vram("VAE on GPU")
+            latents_cache = encode_images_to_latents(vae, all_image_paths, args.resolution, device, cache_dir)
+        finally:
+            del vae
+            gc.collect()
+            torch.cuda.empty_cache()
+            log_vram("after VAE unload")
+
+    sample_latent = next(iter(latents_cache.values()))
+    print(f"[rlhf]   Latent shape: {list(sample_latent.shape)}, dtype={sample_latent.dtype}")
+    print(f"[rlhf]   {len(latents_cache)} latents ready in {time.time() - t0:.1f}s")
+
+    # --- Embeddings ---
+    t0 = time.time()
+    write_status(args.status_file, 0, args.max_train_steps, 0.0, "caching_embeddings")
+
+    if embeddings_fully_cached:
+        print(f"[rlhf] Loading {len(set(prompts))} embeddings from cache...")
+        embed_cache = load_embeddings_from_cache(prompts, cache_dir)
+    else:
+        print(f"[rlhf] Encoding {len(set(prompts))} unique prompts with Qwen3...")
+        try:
+            text_encoder = Qwen3ForCausalLM.from_pretrained(
+                model_path, subfolder="text_encoder", torch_dtype=dtype
+            )
+            tokenizer = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer")
+            num_te_params = sum(p.numel() for p in text_encoder.parameters())
+            print(f"[rlhf]   Text encoder loaded ({num_te_params:,} params, vocab_size={tokenizer.vocab_size})")
+            text_encoder = text_encoder.to(device)
+            text_encoder.eval()
+            log_vram("text encoder on GPU")
+            embed_cache = encode_prompts(tokenizer, text_encoder, prompts, device, cache_dir)
+        finally:
+            del text_encoder, tokenizer
+            gc.collect()
+            torch.cuda.empty_cache()
+            log_vram("after text encoder unload")
+
+    sample_emb = next(iter(embed_cache.values()))
+    print(f"[rlhf]   Embedding shape: {list(sample_emb['embed'].shape)}, dtype={sample_emb['embed'].dtype}")
+    print(f"[rlhf]   {len(embed_cache)} embeddings ready in {time.time() - t0:.1f}s")
+    print("-" * 70)
+
+    # -----------------------------------------------------------------------
+    # Phase 2: Load transformer into a clean memory state.
+    # VAE and text encoder are completely gone at this point.
+    # -----------------------------------------------------------------------
+    write_status(args.status_file, 0, args.max_train_steps, 0.0, "loading_model")
+
     try:
-        # Load transformer
+        t0 = time.time()
+        print(f"[rlhf] Loading transformer...")
         transformer_path = os.path.join(model_path, "transformer")
         if os.path.isdir(transformer_path):
+            print(f"[rlhf]   from_pretrained: path={transformer_path}, dtype={dtype}")
             transformer = ZImageTransformer2DModel.from_pretrained(
                 transformer_path, torch_dtype=dtype
             )
         else:
+            print(f"[rlhf]   from_pretrained: path={model_path}, subfolder=transformer, dtype={dtype}")
             transformer = ZImageTransformer2DModel.from_pretrained(
                 model_path, subfolder="transformer", torch_dtype=dtype
             )
-        print(f"[rlhf] Transformer loaded")
-
-        # Load VAE (always float32 for encoding accuracy)
-        vae = AutoencoderKL.from_pretrained(model_path, subfolder="vae", torch_dtype=torch.float32)
-        print(f"[rlhf] VAE loaded")
-
-        # Load Qwen3 text encoder + tokenizer
-        text_encoder = Qwen3ForCausalLM.from_pretrained(
-            model_path, subfolder="text_encoder", torch_dtype=dtype
-        )
-        tokenizer = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer")
-        print(f"[rlhf] Text encoder + tokenizer loaded")
-
+        num_transformer_params = sum(p.numel() for p in transformer.parameters())
+        print(f"[rlhf]   Transformer loaded in {time.time() - t0:.1f}s "
+              f"({num_transformer_params:,} params, "
+              f"{format_bytes(sum(p.numel() * p.element_size() for p in transformer.parameters()))})")
+        log_vram("after transformer load")
     except Exception as e:
         print(f"[rlhf] ERROR loading model: {e}", file=sys.stderr)
         import traceback
@@ -536,55 +829,32 @@ def main():
         write_status(args.status_file, 0, args.max_train_steps, 0.0, "error")
         sys.exit(1)
 
+    print("-" * 70)
+
     # -----------------------------------------------------------------------
     # Create LoRA network on transformer
     # -----------------------------------------------------------------------
-    print(f"[rlhf] Creating LoRA adapter (rank={args.lora_rank})")
+    t0 = time.time()
+    print(f"[rlhf] Creating LoRA adapter (rank={args.lora_rank}, alpha={args.lora_rank})")
     lora_network = create_lora_network(transformer, args.lora_rank)
 
     if args.gradient_checkpointing:
         transformer.enable_gradient_checkpointing()
-
-    # -----------------------------------------------------------------------
-    # Cache image latents, then unload VAE
-    # -----------------------------------------------------------------------
-    print("[rlhf] Encoding images to latents...")
-    write_status(args.status_file, 0, args.max_train_steps, 0.0, "caching_latents")
-    vae = vae.to(device)
-    cache_dir = os.path.join(args.output_dir, "cache")
-
-    all_image_paths = []
-    for p in preferences:
-        all_image_paths.append(p["winner_path"])
-        all_image_paths.append(p["loser_path"])
-
-    latents_cache = encode_images_to_latents(vae, all_image_paths, args.resolution, device, cache_dir)
-    del vae
-    torch.cuda.empty_cache()
-    print(f"[rlhf] VAE unloaded, {len(latents_cache)} latents cached")
-
-    # -----------------------------------------------------------------------
-    # Cache text embeddings, then unload text encoder
-    # -----------------------------------------------------------------------
-    print("[rlhf] Encoding prompts with Qwen3...")
-    write_status(args.status_file, 0, args.max_train_steps, 0.0, "caching_embeddings")
-    text_encoder = text_encoder.to(device)
-    text_encoder.eval()
-    prompts = [p["prompt"] for p in preferences]
-    embed_cache = encode_prompts(tokenizer, text_encoder, prompts, device, cache_dir)
-    del text_encoder, tokenizer
-    torch.cuda.empty_cache()
-    print(f"[rlhf] Text encoder unloaded, {len(embed_cache)} embeddings cached")
+        print(f"[rlhf]   Gradient checkpointing enabled")
+    print(f"[rlhf]   LoRA created in {time.time() - t0:.1f}s")
+    log_vram("after LoRA creation")
+    print("-" * 70)
 
     # -----------------------------------------------------------------------
     # Move transformer to device (with optional block swapping for low VRAM)
     # -----------------------------------------------------------------------
+    t0 = time.time()
     blocks_to_swap = args.blocks_to_swap
     if blocks_to_swap > 0:
         # Block swapping: keep N blocks on CPU, move to GPU on-the-fly during
         # forward/backward.  The non-block parameters (patch embed, final norm,
         # etc.) always stay on GPU since they are small.
-        print(f"[rlhf] Block swapping enabled: {blocks_to_swap} of 32 blocks on CPU")
+        print(f"[rlhf] Block swapping enabled: {blocks_to_swap} blocks on CPU")
 
         # Identify the block lists.
         # ZImageTransformer2DModel uses: layers, noise_refiner, context_refiner
@@ -624,16 +894,22 @@ def main():
         def _make_post_hook(block_ref):
             def hook(module, args, output):
                 block_ref.to("cpu")
-                torch.cuda.empty_cache()
             return hook
         for block in cpu_blocks:
             block.register_forward_pre_hook(_make_pre_hook(block))
             block.register_forward_hook(_make_post_hook(block))
 
-        lora_network = lora_network.to(device)
+        # Don't call lora_network.to(device) here — LoRA weights live inside
+        # the transformer blocks and are already on the correct device.
+        # GPU blocks have their LoRA on GPU, CPU blocks have theirs on CPU.
+        # The forward hooks will swap CPU blocks (and their LoRA) on demand.
     else:
+        print(f"[rlhf] Moving transformer to {device} (no block swapping)...")
         transformer = transformer.to(device)
         lora_network = lora_network.to(device)
+
+    print(f"[rlhf]   Transformer placement done in {time.time() - t0:.1f}s")
+    log_vram("transformer on device")
 
     transformer.requires_grad_(False)  # Freeze base weights
     lora_network.train()
@@ -652,19 +928,85 @@ def main():
 
     num_trainable = sum(p.numel() for p in trainable_params)
     num_total = sum(p.numel() for p in transformer.parameters())
-    print(f"[rlhf] Trainable params: {num_trainable:,} / {num_total:,} ({100*num_trainable/num_total:.2f}%)")
+    trainable_bytes = sum(p.numel() * p.element_size() for p in trainable_params)
+    print(f"[rlhf] Parameter summary:")
+    print(f"[rlhf]   Trainable (LoRA): {num_trainable:,} ({format_bytes(trainable_bytes)})")
+    print(f"[rlhf]   Total (transformer): {num_total:,}")
+    print(f"[rlhf]   Trainable ratio: {100*num_trainable/num_total:.2f}%")
 
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=1e-4)
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.max_train_steps)
+    print(f"[rlhf] Optimizer: AdamW (lr={args.learning_rate:.2e}, weight_decay=1e-4)")
+    print(f"[rlhf] LR scheduler: CosineAnnealingLR (T_max={args.max_train_steps})")
+
+    setup_time = time.time() - train_start_time
+    print("-" * 70)
+    print(f"[rlhf] Setup complete in {format_duration(setup_time)}")
+    log_vram("before training loop")
+    print("=" * 70)
 
     # -----------------------------------------------------------------------
     # Training loop
     # -----------------------------------------------------------------------
     print(f"[rlhf] Starting training for {args.max_train_steps} steps")
+    print(f"[rlhf]   Save checkpoints every {args.save_every} steps")
+    print(f"[rlhf]   Verbose log every step")
     write_status(args.status_file, 0, args.max_train_steps, 0.0, "running")
     running_loss = 0.0
+    control_file = args.control_file
+
+    # Timing accumulators
+    step_times = []
+    forward_times = []
+    backward_times = []
+    optimizer_times = []
+    loop_start_time = time.time()
+    consecutive_oom = 0
 
     for step in range(1, args.max_train_steps + 1):
+        step_start = time.time()
+
+        # Check control file for pause/stop signals
+        action = check_control(control_file)
+        if action == "stop":
+            print(f"\n[rlhf] **** Stop signal received at step {step} ****")
+            ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{step}")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            if hasattr(lora_network, 'save_weights'):
+                lora_network.save_weights(ckpt_dir, dtype=dtype)
+            else:
+                torch.save(lora_network.state_dict(), os.path.join(ckpt_dir, "lora_weights.safetensors"))
+            print(f"[rlhf] Saved checkpoint at step {step} before stopping")
+            write_status(args.status_file, step, args.max_train_steps, running_loss, "stopped")
+            total_time = time.time() - train_start_time
+            print(f"[rlhf] Stopped after {format_duration(total_time)} total ({step - 1} steps completed)")
+            return
+        if action == "pause":
+            print(f"\n[rlhf] **** Pause signal received at step {step} ****")
+            write_status(args.status_file, step, args.max_train_steps, running_loss, "paused")
+            pause_start = time.time()
+            while True:
+                time.sleep(1)
+                action = check_control(control_file)
+                if action == "resume" or action == "run":
+                    pause_dur = time.time() - pause_start
+                    print(f"[rlhf] Resuming training at step {step} (paused for {format_duration(pause_dur)})")
+                    write_status(args.status_file, step, args.max_train_steps, running_loss, "running")
+                    break
+                if action == "stop":
+                    print(f"[rlhf] **** Stop signal received while paused at step {step} ****")
+                    ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{step}")
+                    os.makedirs(ckpt_dir, exist_ok=True)
+                    if hasattr(lora_network, 'save_weights'):
+                        lora_network.save_weights(ckpt_dir, dtype=dtype)
+                    else:
+                        torch.save(lora_network.state_dict(), os.path.join(ckpt_dir, "lora_weights.safetensors"))
+                    print(f"[rlhf] Saved checkpoint at step {step} before stopping")
+                    write_status(args.status_file, step, args.max_train_steps, running_loss, "stopped")
+                    total_time = time.time() - train_start_time
+                    print(f"[rlhf] Stopped after {format_duration(total_time)} total ({step - 1} steps completed)")
+                    return
+
         pair = random.choice(preferences)
 
         w_lat = latents_cache[pair["winner_path"]]
@@ -688,43 +1030,144 @@ def main():
         t, sigma = sample_timestep_sigma(batch_size=1)
         noise = torch.randn_like(winner_latent)
 
-        optimizer.zero_grad()
-        loss = compute_dpo_loss(
-            transformer, lora_network,
-            winner_latent, loser_latent,
-            prompt_embed, prompt_mask,
-            sigma, t, noise,
-            args.beta, dtype, device,
-        )
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-        optimizer.step()
-        lr_scheduler.step()
+        try:
+            optimizer.zero_grad()
+
+            # Forward pass (reference + policy)
+            t_fwd = time.time()
+            loss = compute_dpo_loss(
+                transformer, lora_network,
+                winner_latent, loser_latent,
+                prompt_embed, prompt_mask,
+                sigma, t, noise,
+                args.beta, dtype, device,
+            )
+            fwd_elapsed = time.time() - t_fwd
+            forward_times.append(fwd_elapsed)
+
+            # Backward pass
+            t_bwd = time.time()
+            loss.backward()
+            bwd_elapsed = time.time() - t_bwd
+            backward_times.append(bwd_elapsed)
+
+            # Gradient norm (before clipping)
+            grad_norm_raw = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+
+            # Optimizer step
+            t_opt = time.time()
+            optimizer.step()
+            lr_scheduler.step()
+            opt_elapsed = time.time() - t_opt
+            optimizer_times.append(opt_elapsed)
+
+            consecutive_oom = 0
+
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                consecutive_oom += 1
+                print(f"\n[rlhf] *** CUDA OOM at step {step} (consecutive: {consecutive_oom}/3) ***")
+                log_vram("OOM")
+                if consecutive_oom >= 3:
+                    print("[rlhf] ERROR: 3 consecutive OOMs, aborting training", file=sys.stderr)
+                    write_status(args.status_file, step, args.max_train_steps, running_loss, "error")
+                    sys.exit(1)
+                optimizer.zero_grad()
+                torch.cuda.empty_cache()
+                print(f"[rlhf]   Skipping step {step}, cleared GPU memory")
+                continue
+            else:
+                raise
 
         loss_val = loss.item()
         running_loss = 0.9 * running_loss + 0.1 * loss_val if step > 1 else loss_val
 
-        if step % args.status_every == 0:
-            print(f"[rlhf] Step {step}/{args.max_train_steps} | loss={running_loss:.4f}")
-            write_status(args.status_file, step, args.max_train_steps, running_loss, "running")
+        step_elapsed = time.time() - step_start
+        step_times.append(step_elapsed)
+
+        # Speed calculation (updated every step)
+        avg_step_time = sum(step_times[-50:]) / len(step_times[-50:])
+        if avg_step_time < 1.0:
+            speed_str = f"{1.0 / avg_step_time:.2f} iter/s"
+        else:
+            speed_str = f"{avg_step_time:.2f} s/iter"
+
+        # Write status every step so the UI stays responsive
+        write_status(args.status_file, step, args.max_train_steps, running_loss, "running", speed_str)
+
+        lr_current = optimizer.param_groups[0]['lr']
+
+        # ETA
+        remaining_steps = args.max_train_steps - step
+        eta_seconds = remaining_steps * avg_step_time
+        eta_str = format_duration(eta_seconds)
+        elapsed_str = format_duration(time.time() - loop_start_time)
+
+        # Timing breakdown (averages over last 50 steps)
+        avg_fwd = sum(forward_times[-50:]) / max(len(forward_times[-50:]), 1)
+        avg_bwd = sum(backward_times[-50:]) / max(len(backward_times[-50:]), 1)
+        avg_opt = sum(optimizer_times[-50:]) / max(len(optimizer_times[-50:]), 1)
+
+        print(f"[rlhf] ---------- Step {step}/{args.max_train_steps} ----------")
+        print(f"[rlhf]   loss={running_loss:.4e}  loss_raw={loss_val:.4e}  "
+              f"lr={lr_current:.2e}  grad_norm={grad_norm_raw:.4f}")
+        print(f"[rlhf]   {speed_str}  elapsed={elapsed_str}  ETA={eta_str}")
+        print(f"[rlhf]   timing: fwd={avg_fwd:.3f}s  bwd={avg_bwd:.3f}s  opt={avg_opt:.3f}s  "
+              f"step={avg_step_time:.3f}s")
+
+        append_loss_log(args.output_dir, step, running_loss)
+
+        # VRAM logging every 100 steps
+        if step % 100 == 0:
+            log_vram(f"step {step}")
 
         if step % args.save_every == 0 or step == args.max_train_steps:
+            print(f"\n[rlhf] ==== SAVING CHECKPOINT at step {step} ====")
+            t0 = time.time()
             ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{step}")
             os.makedirs(ckpt_dir, exist_ok=True)
-            if hasattr(lora_network, 'save_weights'):
-                lora_network.save_weights(ckpt_dir, dtype=dtype)
-            else:
-                torch.save(lora_network.state_dict(), os.path.join(ckpt_dir, "lora_weights.safetensors"))
-            print(f"[rlhf] Saved checkpoint to {ckpt_dir}")
+            save_lora_weights(lora_network, ckpt_dir, dtype)
+            save_time = time.time() - t0
+            # Report checkpoint file sizes
+            total_ckpt_size = sum(
+                f.stat().st_size for f in Path(ckpt_dir).rglob("*") if f.is_file()
+            )
+            print(f"[rlhf]   Saved to {ckpt_dir} ({format_bytes(total_ckpt_size)}) in {save_time:.1f}s")
+
+    # -----------------------------------------------------------------------
+    # Training complete — save final and print summary
+    # -----------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("  Training Complete")
+    print("=" * 70)
 
     final_dir = os.path.join(args.output_dir, "final")
     os.makedirs(final_dir, exist_ok=True)
-    if hasattr(lora_network, 'save_weights'):
-        lora_network.save_weights(final_dir, dtype=dtype)
-    else:
-        torch.save(lora_network.state_dict(), os.path.join(final_dir, "lora_weights.safetensors"))
-    print(f"[rlhf] Training complete. Final LoRA saved to {final_dir}")
+    save_lora_weights(lora_network, final_dir, dtype)
+    print(f"[rlhf] Final LoRA saved to {final_dir}")
     write_status(args.status_file, args.max_train_steps, args.max_train_steps, running_loss, "completed")
+
+    total_time = time.time() - train_start_time
+    loop_time = time.time() - loop_start_time
+    avg_step_time = sum(step_times) / max(len(step_times), 1)
+    avg_fwd = sum(forward_times) / max(len(forward_times), 1)
+    avg_bwd = sum(backward_times) / max(len(backward_times), 1)
+    avg_opt = sum(optimizer_times) / max(len(optimizer_times), 1)
+
+    print(f"[rlhf] Summary:")
+    print(f"[rlhf]   Total time:       {format_duration(total_time)} (setup: {format_duration(setup_time)}, training: {format_duration(loop_time)})")
+    print(f"[rlhf]   Steps completed:  {args.max_train_steps}")
+    print(f"[rlhf]   Final loss:       {running_loss:.4e}")
+    print(f"[rlhf]   Avg step time:    {avg_step_time:.3f}s")
+    print(f"[rlhf]   Avg forward:      {avg_fwd:.3f}s")
+    print(f"[rlhf]   Avg backward:     {avg_bwd:.3f}s")
+    print(f"[rlhf]   Avg optimizer:    {avg_opt:.3f}s")
+    if avg_step_time < 1.0:
+        print(f"[rlhf]   Throughput:       {1.0 / avg_step_time:.2f} iter/s")
+    else:
+        print(f"[rlhf]   Throughput:       {avg_step_time:.2f} s/iter")
+    log_vram("final")
+    print("=" * 70)
 
 
 if __name__ == "__main__":

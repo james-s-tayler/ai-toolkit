@@ -4,14 +4,18 @@ import { useState, useEffect, useCallback } from 'react';
 import { apiClient } from '@/utils/api';
 import { RlhfTrainingRun } from '@prisma/client';
 
+interface TrainingRunWithSpeed extends RlhfTrainingRun {
+  speed_string?: string;
+}
+
 interface Props {
   sessionId: string;
   onStatusChange: () => void;
 }
 
 export default function TrainingMonitor({ sessionId, onStatusChange }: Props) {
-  const [runs, setRuns] = useState<RlhfTrainingRun[]>([]);
-  const [selectedRun, setSelectedRun] = useState<RlhfTrainingRun | null>(null);
+  const [runs, setRuns] = useState<TrainingRunWithSpeed[]>([]);
+  const [selectedRun, setSelectedRun] = useState<TrainingRunWithSpeed | null>(null);
   const [isLoading, setIsLoading] = useState(true);
 
   const fetchRuns = useCallback(async () => {
@@ -44,7 +48,7 @@ export default function TrainingMonitor({ sessionId, onStatusChange }: Props) {
 
   // Poll active run
   useEffect(() => {
-    if (!selectedRun || (selectedRun.status !== 'running' && selectedRun.status !== 'pending')) return;
+    if (!selectedRun || (selectedRun.status !== 'running' && selectedRun.status !== 'pending' && selectedRun.status !== 'paused')) return;
     const timer = setInterval(() => fetchRunStatus(selectedRun.id), 5000);
     return () => clearInterval(timer);
   }, [selectedRun, fetchRunStatus]);
@@ -60,7 +64,9 @@ export default function TrainingMonitor({ sessionId, onStatusChange }: Props) {
   const statusColors: Record<string, string> = {
     pending: 'text-gray-400',
     running: 'text-blue-400',
+    paused: 'text-amber-400',
     completed: 'text-green-400',
+    stopped: 'text-gray-400',
     error: 'text-red-400',
   };
 
@@ -77,12 +83,13 @@ export default function TrainingMonitor({ sessionId, onStatusChange }: Props) {
 
         <div className="flex justify-between text-sm text-gray-400">
           <span>Step {run.step} / {run.total_steps}</span>
+          <span>{run.speed_string || ''}</span>
           <span>Loss: {run.loss.toFixed(4)}</span>
           <span>{pct}%</span>
         </div>
         <div className="w-full bg-gray-700 rounded-full h-2">
           <div
-            className={`h-2 rounded-full transition-all ${run.status === 'completed' ? 'bg-green-500' : 'bg-purple-500'}`}
+            className={`h-2 rounded-full transition-all ${run.status === 'completed' ? 'bg-green-500' : run.status === 'paused' ? 'bg-amber-500' : 'bg-purple-500'}`}
             style={{ width: `${pct}%` }}
           />
         </div>

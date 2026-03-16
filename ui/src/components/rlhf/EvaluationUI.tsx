@@ -14,9 +14,10 @@ interface EvalStats {
 interface Props {
   sessionId: string;
   sessionStatus: string;
+  initialPairId?: string | null;
 }
 
-export default function EvaluationUI({ sessionId, sessionStatus }: Props) {
+export default function EvaluationUI({ sessionId, sessionStatus, initialPairId }: Props) {
   const [currentPair, setCurrentPair] = useState<RlhfPair | null>(null);
   const [prefetchedPairs, setPrefetchedPairs] = useState<RlhfPair[]>([]);
   const prefetchedRef = useRef<RlhfPair[]>([]);
@@ -30,6 +31,30 @@ export default function EvaluationUI({ sessionId, sessionStatus }: Props) {
 
   // Keep ref in sync with state to avoid stale closures
   useEffect(() => { prefetchedRef.current = prefetchedPairs; }, [prefetchedPairs]);
+
+  const fetchStats = useCallback(async () => {
+    try {
+      const res = await apiClient.get(`/api/rlhf/${sessionId}/evaluate`);
+      setStats(res.data.stats);
+    } catch (e) {
+      // ignore
+    }
+  }, [sessionId]);
+
+  const fetchPairById = useCallback(async (pairId: string) => {
+    setIsLoading(true);
+    try {
+      const res = await apiClient.get(`/api/rlhf/${sessionId}/pairs/${pairId}`);
+      setCurrentPair(res.data);
+      setPrefetchedPairs([]);
+      setSwapped(false);
+      await fetchStats();
+    } catch (e) {
+      console.error('Error fetching pair:', e);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [sessionId, fetchStats]);
 
   const fetchNext = useCallback(async (prefetched?: RlhfPair[]) => {
     if (prefetched && prefetched.length > 0) {
@@ -57,7 +82,14 @@ export default function EvaluationUI({ sessionId, sessionStatus }: Props) {
     }
   }, [sessionId]);
 
-  useEffect(() => { fetchNext(); }, [fetchNext]);
+  useEffect(() => {
+    if (initialPairId) {
+      fetchPairById(initialPairId);
+    } else {
+      fetchNext();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const sendPreference = useCallback(async (visualSide: 'left' | 'right' | 'tie' | 'skip') => {
     if (!currentPair || isSendingRef.current) return;

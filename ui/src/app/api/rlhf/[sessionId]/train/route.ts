@@ -46,7 +46,8 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       max_train_steps = 2000,
       lora_rank = 16,
       batch_size = 1,
-      blocks_to_swap = 0,
+      blocks_to_swap = 16,
+      save_every = 250,
       mixed_precision = 'bf16',
       gradient_checkpointing = true,
     } = body;
@@ -83,7 +84,11 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     fs.writeFileSync(prefDataPath, JSON.stringify(preferences, null, 2));
 
     const statusFilePath = path.join(outputDir, 'status.json');
+    const controlFilePath = path.join(outputDir, 'control.json');
     const logPath = path.join(outputDir, 'train.log');
+
+    // Clear any previous control file so a fresh run starts cleanly
+    if (fs.existsSync(controlFilePath)) fs.unlinkSync(controlFilePath);
 
     const config = {
       beta,
@@ -92,6 +97,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       lora_rank,
       batch_size,
       blocks_to_swap,
+      save_every,
       mixed_precision,
       gradient_checkpointing,
     };
@@ -110,11 +116,16 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     const pythonPath = getPythonPath();
     const scriptPath = path.join(TOOLKIT_ROOT, 'scripts', 'rlhf_dpo_train.py');
 
+    // Cache dir lives at session level so it persists across training runs
+    const sessionDir = session.output_dir || path.join(TOOLKIT_ROOT, 'data', 'rlhf', session.name);
+    const cacheDir = path.join(sessionDir, 'cache');
+
     const args = [
       scriptPath,
       '--preference_data', prefDataPath,
       '--model_path', session.model_path,
       '--output_dir', outputDir,
+      '--cache_dir', cacheDir,
       '--status_file', statusFilePath,
       '--run_id', run.id,
       '--beta', String(beta),
@@ -124,6 +135,8 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       '--batch_size', String(batch_size),
       '--blocks_to_swap', String(blocks_to_swap),
       '--mixed_precision', mixed_precision,
+      '--save_every', String(save_every),
+      '--control_file', controlFilePath,
     ];
 
     if (gradient_checkpointing) args.push('--gradient_checkpointing');
@@ -131,6 +144,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     const additionalEnv: Record<string, string> = {
       CUDA_DEVICE_ORDER: 'PCI_BUS_ID',
       CUDA_VISIBLE_DEVICES: session.gpu_ids,
+      PYTHONUNBUFFERED: '1',
     };
 
     const logFd = fs.openSync(logPath, 'a');
