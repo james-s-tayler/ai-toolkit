@@ -50,6 +50,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       save_every = 250,
       mixed_precision = 'bf16',
       gradient_checkpointing = true,
+      quantize = 'none',
     } = body;
 
     const session = await prisma.rlhfSession.findUnique({ where: { id: sessionId } });
@@ -100,6 +101,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       save_every,
       mixed_precision,
       gradient_checkpointing,
+      quantize,
     };
 
     const run = await prisma.rlhfTrainingRun.create({
@@ -136,6 +138,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       '--blocks_to_swap', String(blocks_to_swap),
       '--mixed_precision', mixed_precision,
       '--save_every', String(save_every),
+      '--quantize', quantize,
       '--control_file', controlFilePath,
     ];
 

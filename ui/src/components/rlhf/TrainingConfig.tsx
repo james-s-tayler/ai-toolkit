@@ -12,6 +12,7 @@ export interface TrainingParams {
   save_every: number;
   mixed_precision: string;
   gradient_checkpointing: boolean;
+  quantize: string;
 }
 
 export const DEFAULT_TRAINING_PARAMS: TrainingParams = {
@@ -24,6 +25,7 @@ export const DEFAULT_TRAINING_PARAMS: TrainingParams = {
   save_every: 250,
   mixed_precision: 'bf16',
   gradient_checkpointing: true,
+  quantize: 'none',
 };
 
 interface Props {
@@ -102,6 +104,13 @@ export default function TrainingConfig({ onStartTraining, initialConfig, evaluat
             <option value="bf16">bf16</option>
             <option value="fp16">fp16</option>
             <option value="no">no (fp32)</option>
+          </select>
+        </div>
+        <div>
+          <label className={labelClass}>Quantize Base Model</label>
+          <select value={params.quantize} onChange={setParam('quantize')} disabled={disabled} className={fieldClass}>
+            <option value="none">None</option>
+            <option value="qfloat8">FP8</option>
           </select>
         </div>
         <div className="flex items-end pb-1.5">

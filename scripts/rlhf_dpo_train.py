@@ -85,6 +85,9 @@ def parse_args():
     parser.add_argument("--save_every", type=int, default=250)
     parser.add_argument("--status_every", type=int, default=10)
     parser.add_argument("--resolution", type=int, default=1024)
+    parser.add_argument("--quantize", type=str, default="none",
+                        choices=["none", "qfloat8"],
+                        help="Quantize base model weights (qfloat8 = FP8, auto-converts to torchao float8 when block swapping)")
     parser.add_argument("--control_file", type=str, default="",
                         help="Path to control.json for pause/resume/stop signalling")
     return parser.parse_args()
@@ -660,6 +663,7 @@ def main():
     print(f"[rlhf]   resolution        = {args.resolution}")
     print(f"[rlhf]   mixed_precision   = {args.mixed_precision}")
     print(f"[rlhf]   grad_checkpointing= {args.gradient_checkpointing}")
+    print(f"[rlhf]   quantize          = {args.quantize}")
     print(f"[rlhf]   control_file      = {args.control_file or '(none)'}")
 
     # -------------------------------------------------------------------
@@ -832,6 +836,70 @@ def main():
     print("-" * 70)
 
     # -----------------------------------------------------------------------
+    # Quantize transformer (FP8) — before LoRA so LoRA wraps quantized layers
+    # -----------------------------------------------------------------------
+    if args.quantize != "none":
+        t0 = time.time()
+        qtype_name = args.quantize  # "qfloat8"
+
+        # Auto-convert qfloat8 → float8 (torchao) when block swapping is active.
+        # quanto QTensors don't transfer cleanly between CPU/GPU.
+        # (Same pattern as config_modules.py)
+        if args.blocks_to_swap > 0 and qtype_name == "qfloat8":
+            qtype_name = "float8"
+            print(f"[rlhf] Quantization: auto-converted qfloat8 → float8 (torchao) for block swapping compatibility")
+
+        # Add toolkit root to sys.path so we can import toolkit.util.quantize
+        toolkit_root = os.path.join(os.path.dirname(__file__), "..")
+        if toolkit_root not in sys.path:
+            sys.path.insert(0, toolkit_root)
+
+        from toolkit.util.quantize import quantize as qt_quantize, get_qtype
+        from optimum.quanto import freeze
+
+        quantization_type = get_qtype(qtype_name)
+        print(f"[rlhf] Quantizing transformer to {qtype_name}...")
+
+        # Quantize block-by-block: move each block to GPU → quantize → freeze → move back to CPU
+        # This avoids OOM from quantizing the entire model on GPU at once.
+        block_attrs = ["layers", "noise_refiner", "context_refiner"]
+        all_blocks = []
+        for attr in block_attrs:
+            bl = getattr(transformer, attr, None)
+            if bl is not None:
+                all_blocks.extend(list(bl))
+
+        print(f"[rlhf]   Quantizing {len(all_blocks)} transformer blocks...")
+        for i, block in enumerate(all_blocks):
+            block.to(device, dtype=dtype)
+            qt_quantize(block, weights=quantization_type)
+            freeze(block)
+            block.to("cpu")
+
+        # Quantize remaining non-block submodules (embedders, norms, etc.)
+        # These are small and stay on GPU permanently (block-swapping only
+        # offloads blocks). We leave them on GPU after quantizing because
+        # torchao AffineQuantizedTensor doesn't move with .to(device).
+        print(f"[rlhf]   Quantizing remaining layers (embedders, norms)...")
+        block_child_names = set()
+        for attr in block_attrs:
+            bl = getattr(transformer, attr, None)
+            if bl is not None:
+                block_child_names.add(attr)
+        for name, child in transformer.named_children():
+            if name not in block_child_names:
+                child.to(device, dtype=dtype)
+                qt_quantize(child, weights=quantization_type)
+                freeze(child)
+
+        num_params_after = sum(p.numel() for p in transformer.parameters())
+        model_bytes = sum(p.numel() * p.element_size() for p in transformer.parameters())
+        print(f"[rlhf]   Quantization complete in {time.time() - t0:.1f}s "
+              f"({num_params_after:,} params, {format_bytes(model_bytes)})")
+        log_vram("after quantization")
+        print("-" * 70)
+
+    # -----------------------------------------------------------------------
     # Create LoRA network on transformer
     # -----------------------------------------------------------------------
     t0 = time.time()
@@ -870,21 +938,38 @@ def main():
         cpu_blocks = all_blocks[len(all_blocks) - n_swap :]
         print(f"[rlhf]   Total blocks: {len(all_blocks)}, on GPU: {len(gpu_blocks)}, on CPU: {len(cpu_blocks)}")
 
-        # Start with everything on CPU, then selectively move to GPU
-        transformer = transformer.to("cpu")
+        if args.quantize != "none":
+            # When quantized, non-block child modules are already on GPU from
+            # the quantization step and torchao tensors don't survive .to() moves.
+            # Move blocks to their designated devices, and ensure any top-level
+            # params/buffers (e.g. pad_token) not inside child modules are on GPU.
+            block_prefixes = tuple(a + "." for a in block_attrs)
+            for name, param in transformer.named_parameters():
+                if not name.startswith(block_prefixes):
+                    param.data = param.data.to(device)
+            for name, buf in transformer.named_buffers():
+                if not name.startswith(block_prefixes):
+                    buf.data = buf.data.to(device)
+            for block in cpu_blocks:
+                block.to("cpu")
+            for block in gpu_blocks:
+                block.to(device)
+        else:
+            # Start with everything on CPU, then selectively move to GPU
+            transformer = transformer.to("cpu")
 
-        # Move non-block params (embedders, norms, etc.) to GPU
-        block_prefixes = tuple(a + "." for a in block_attrs)
-        for name, param in transformer.named_parameters():
-            if not name.startswith(block_prefixes):
-                param.data = param.data.to(device)
-        for name, buf in transformer.named_buffers():
-            if not name.startswith(block_prefixes):
-                buf.data = buf.data.to(device)
+            # Move non-block params (embedders, norms, etc.) to GPU
+            block_prefixes = tuple(a + "." for a in block_attrs)
+            for name, param in transformer.named_parameters():
+                if not name.startswith(block_prefixes):
+                    param.data = param.data.to(device)
+            for name, buf in transformer.named_buffers():
+                if not name.startswith(block_prefixes):
+                    buf.data = buf.data.to(device)
 
-        # Move GPU-resident blocks
-        for block in gpu_blocks:
-            block.to(device)
+            # Move GPU-resident blocks
+            for block in gpu_blocks:
+                block.to(device)
 
         # Register forward hooks to swap CPU blocks to/from GPU on demand
         def _make_pre_hook(block_ref):
