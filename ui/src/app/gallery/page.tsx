@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef } from 'react';
 import Link from 'next/link';
 import { Button } from '@headlessui/react';
-import { FaRegTrashAlt, FaInfoCircle, FaFolderPlus } from 'react-icons/fa';
+import { FaRegTrashAlt, FaInfoCircle, FaFolderPlus, FaColumns } from 'react-icons/fa';
 import { openConfirm } from '@/components/ConfirmModal';
 import { TopBar, MainContent } from '@/components/layout';
 import UniversalTable, { TableColumn } from '@/components/UniversalTable';
@@ -11,6 +11,8 @@ import { apiClient } from '@/utils/api';
 import { Tooltip } from '@/components/Tooltip';
 import { formatDuration } from '@/utils/basic';
 import { Modal } from '@/components/Modal';
+import CompareSelectModal from '@/components/CompareSelectModal';
+import { useRouter } from 'next/navigation';
 
 interface GalleryFolder {
   id: number;
@@ -68,6 +70,8 @@ export default function GalleryPage() {
   const [addRecursive, setAddRecursive] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
   const [isAdding, setIsAdding] = useState(false);
+  const [isCompareModalOpen, setIsCompareModalOpen] = useState(false);
+  const router = useRouter();
 
   const refreshFolders = () => {
     setStatus('loading');
@@ -292,7 +296,16 @@ export default function GalleryPage() {
           <h1 className="text-2xl font-semibold text-gray-100">Gallery</h1>
         </div>
         <div className="flex-1" />
-        <div>
+        <div className="flex gap-2">
+          {folders.length >= 2 && (
+            <Button
+              className="text-gray-200 bg-slate-600 px-4 py-2 rounded-md hover:bg-slate-500 transition-colors flex items-center gap-2"
+              onClick={() => setIsCompareModalOpen(true)}
+            >
+              <FaColumns />
+              Compare Folders
+            </Button>
+          )}
           <Button
             className="text-gray-200 bg-slate-600 px-4 py-2 rounded-md hover:bg-slate-500 transition-colors flex items-center gap-2"
             onClick={() => { setAddError(null); setIsAddModalOpen(true); }}
@@ -362,6 +375,23 @@ export default function GalleryPage() {
           </form>
         </div>
       </Modal>
+
+      <CompareSelectModal
+        isOpen={isCompareModalOpen}
+        onClose={() => setIsCompareModalOpen(false)}
+        mode="gallery"
+        items={folders.map(f => ({ label: f.path, value: f.path }))}
+        onCompare={(left, right, center) => {
+          const leftFolder = folders.find(f => f.path === left);
+          const rightFolder = folders.find(f => f.path === right);
+          const centerFolder = center ? folders.find(f => f.path === center) : null;
+          if (leftFolder && rightFolder) {
+            let url = `/gallery/compare?left=${leftFolder.id}&right=${rightFolder.id}`;
+            if (centerFolder) url += `&center=${centerFolder.id}`;
+            router.push(url);
+          }
+        }}
+      />
     </>
   );
 }
