@@ -4,11 +4,7 @@ import { createPortal } from 'react-dom';
 import { Dialog, DialogBackdrop, DialogPanel, DialogTitle } from '@headlessui/react';
 import { FaComment } from 'react-icons/fa';
 import { apiClient } from '@/utils/api';
-
-interface CaptionPreset {
-  name: string;
-  content: string;
-}
+import { type CaptionPreset, applySelections, getActiveVariables } from '@/utils/captionPresets';
 
 interface CaptionModalProps {
   imageUrl: string;
@@ -33,10 +29,13 @@ export default function CaptionModal({ imageUrl, isOpen, onClose, onCaptionGener
   const [triggerWord, setTriggerWord] = useState('');
   const [systemPrompt, setSystemPrompt] = useState(DEFAULT_SYSTEM_PROMPT);
   const [modelId, setModelId] = useState(MODEL_LITE);
+  const [useQuorum, setUseQuorum] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [generatedCaption, setGeneratedCaption] = useState<string | null>(null);
   const [presets, setPresets] = useState<CaptionPreset[]>([]);
+  const [activePreset, setActivePreset] = useState<CaptionPreset | null>(null);
+  const [variableSelections, setVariableSelections] = useState<Record<string, number>>({});
 
   useEffect(() => setMounted(true), []);
 
@@ -70,6 +69,7 @@ export default function CaptionModal({ imageUrl, isOpen, onClose, onCaptionGener
         triggerWord: triggerWord.trim(),
         systemPrompt: systemPrompt.trim(),
         modelId,
+        useQuorum,
       });
       const caption = res.data?.caption ?? '';
       setGeneratedCaption(caption);
@@ -101,7 +101,7 @@ export default function CaptionModal({ imageUrl, isOpen, onClose, onCaptionGener
         <div className="flex min-h-full items-center justify-center p-4 text-center">
           <DialogPanel
             transition
-            className="relative transform overflow-hidden rounded-lg bg-gray-800 text-left shadow-xl transition-all data-closed:translate-y-4 data-closed:opacity-0 data-enter:duration-300 data-enter:ease-out data-leave:duration-200 data-leave:ease-in sm:my-8 w-full max-w-lg data-closed:sm:translate-y-0 data-closed:sm:scale-95"
+            className="relative transform overflow-hidden rounded-lg bg-gray-800 text-left shadow-xl transition-all data-closed:translate-y-4 data-closed:opacity-0 data-enter:duration-300 data-enter:ease-out data-leave:duration-200 data-leave:ease-in sm:my-8 w-full max-w-2xl data-closed:sm:translate-y-0 data-closed:sm:scale-95"
           >
             <div className="bg-gray-800 px-6 pt-5 pb-4">
               <DialogTitle as="h3" className="text-base font-semibold text-gray-100 mb-4 flex items-center gap-2">
@@ -129,6 +129,22 @@ export default function CaptionModal({ imageUrl, isOpen, onClose, onCaptionGener
                 </div>
 
                 <div>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={useQuorum}
+                      onChange={e => setUseQuorum(e.target.checked)}
+                      disabled={isGenerating}
+                      className="rounded bg-gray-700 border-gray-600 text-blue-600 focus:ring-blue-500 disabled:opacity-50"
+                    />
+                    <span className="text-sm text-gray-300">Quorum Captioning</span>
+                  </label>
+                  <p className="mt-1 text-xs text-gray-500">
+                    Generates 5 candidate captions and synthesizes a final caption from elements common to at least 3 of 5. Slower but more accurate.
+                  </p>
+                </div>
+
+                <div>
                   <label className="block text-sm text-gray-400 mb-1">Trigger Word</label>
                   <input
                     type="text"
@@ -150,22 +166,55 @@ export default function CaptionModal({ imageUrl, isOpen, onClose, onCaptionGener
                     <select
                       defaultValue=""
                       disabled={isGenerating}
-                      onChange={e => { if (e.target.value) setSystemPrompt(e.target.value); }}
+                      onChange={e => {
+                        const preset = presets.find(p => p.name === e.target.value);
+                        if (preset) {
+                          const defaultSelections: Record<string, number> = {};
+                          for (const variable of preset.variables) {
+                            defaultSelections[variable.name] = 0;
+                          }
+                          setActivePreset(preset);
+                          setVariableSelections(defaultSelections);
+                          setSystemPrompt(preset.renderedContent);
+                        }
+                      }}
                       className="w-full bg-gray-700 text-white text-sm rounded px-3 py-2 mb-2 disabled:opacity-50"
                       aria-label="Caption preset"
                     >
                       <option value="">— select a preset —</option>
                       {presets.map(p => (
-                        <option key={p.name} value={p.content}>{p.name}</option>
+                        <option key={p.name} value={p.name}>{p.name}</option>
                       ))}
                     </select>
                   )}
+                  {activePreset && getActiveVariables(activePreset.variables, variableSelections).map(variable => (
+                    <div key={variable.name} className="mb-2">
+                      <label className="block text-xs text-gray-400 mb-1">{variable.name}</label>
+                      <select
+                        disabled={isGenerating}
+                        value={(variableSelections[variable.name] ?? 0).toString()}
+                        onChange={e => {
+                          const newSelections = { ...variableSelections, [variable.name]: parseInt(e.target.value, 10) };
+                          setVariableSelections(newSelections);
+                          setSystemPrompt(applySelections(activePreset, newSelections));
+                        }}
+                        className="w-full bg-gray-700 text-white text-sm rounded px-3 py-2 disabled:opacity-50"
+                        aria-label={variable.name}
+                      >
+                        {variable.options.map((opt, idx) => (
+                          <option key={opt.filename} value={idx.toString()}>
+                            {opt.filename.replace(/\.txt$/, '')}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ))}
                   <textarea
                     value={systemPrompt}
                     onChange={e => setSystemPrompt(e.target.value)}
-                    rows={3}
+                    rows={12}
                     disabled={isGenerating}
-                    className="w-full bg-gray-700 text-white text-sm rounded px-3 py-2 resize-none disabled:opacity-50"
+                    className="w-full bg-gray-700 text-white text-sm rounded px-3 py-2 resize-y disabled:opacity-50"
                     aria-label="Caption focus"
                   />
                   <p className="mt-1 text-xs text-gray-500">

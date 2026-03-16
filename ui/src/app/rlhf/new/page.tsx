@@ -18,7 +18,32 @@ export default function NewRlhfSessionPage() {
     setError('');
     try {
       const res = await apiClient.post('/api/rlhf', data);
-      router.push(`/rlhf/${res.data.id}`);
+      const sessionId = res.data.id;
+
+      if (data.dataset_mode === 'import') {
+        // Import datasets immediately after session creation
+        try {
+          const importRes = await apiClient.post(`/api/rlhf/${sessionId}/import`, {
+            accepted_dataset: data.accepted_dataset,
+            rejected_dataset: data.rejected_dataset,
+          });
+          const stats = importRes.data;
+          console.log(
+            `Import complete: ${stats.matched} matched, ` +
+            `${stats.unmatched_accepted} unmatched accepted, ` +
+            `${stats.unmatched_rejected} unmatched rejected`
+          );
+        } catch (importErr: any) {
+          const importError = importErr?.response?.data?.error || 'Failed to import datasets';
+          // Session was created but import failed — delete the session and show error
+          try { await apiClient.delete(`/api/rlhf/${sessionId}`); } catch {}
+          setError(importError);
+          setIsSubmitting(false);
+          return;
+        }
+      }
+
+      router.push(`/rlhf/${sessionId}`);
     } catch (e: any) {
       setError(e?.response?.data?.error || 'Failed to create session');
       setIsSubmitting(false);

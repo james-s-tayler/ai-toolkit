@@ -10,6 +10,7 @@ const statusColors: Record<string, string> = {
   evaluating: 'text-yellow-400',
   training: 'text-purple-400',
   completed: 'text-green-400',
+  imported: 'text-teal-400',
   error: 'text-red-400',
 };
 

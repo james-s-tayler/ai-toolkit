@@ -61,6 +61,12 @@ model VideoDownload {
   @@index([status])
 }
 
+model GalleryFolder {
+  id         Int      @id @default(autoincrement())
+  path       String   @unique
+  created_at DateTime @default(now())
+}
+
 model RlhfSession {
   id                String   @id @default(uuid())
   name              String   @unique
@@ -68,6 +74,7 @@ model RlhfSession {
   model_path        String
   comfyui_url       String   @default("http://127.0.0.1:9188")
   workflow_json     String   @default("")
+  dataset_mode      String   @default("comfyui")
   config_json       String   @default("{}")
   output_dir        String   @default("")
   gpu_ids           String   @default("0")

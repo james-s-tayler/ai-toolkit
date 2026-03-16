@@ -18,9 +18,14 @@ import useCPUInfo from '@/hooks/useCPUInfo';
 
 type TabKey = 'generation' | 'evaluation' | 'training' | 'pairs';
 
-const tabs: { key: TabKey; label: string }[] = [
+const allTabs: { key: TabKey; label: string }[] = [
   { key: 'generation', label: 'Generation' },
   { key: 'evaluation', label: 'Evaluation' },
+  { key: 'training', label: 'Training' },
+  { key: 'pairs', label: 'Pairs' },
+];
+
+const importTabs: { key: TabKey; label: string }[] = [
   { key: 'training', label: 'Training' },
   { key: 'pairs', label: 'Pairs' },
 ];
@@ -45,6 +50,7 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
   const router = useRouter();
   const [session, setSession] = useState<RlhfSession | null>(null);
   const [tab, setTab] = useState<TabKey>('generation');
+  const [initialTabSet, setInitialTabSet] = useState(false);
   const [isTrainingStarting, setIsTrainingStarting] = useState(false);
   const [trainingError, setTrainingError] = useState('');
   const [evaluatedCount, setEvaluatedCount] = useState(0);
@@ -128,6 +134,19 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
       // ignore
     }
   }, [sessionId, latestRunId]);
+
+  const isImportMode = (session as any)?.dataset_mode === 'import';
+  const tabs = isImportMode ? importTabs : allTabs;
+
+  // Set default tab for import sessions
+  useEffect(() => {
+    if (session && !initialTabSet) {
+      if ((session as any).dataset_mode === 'import') {
+        setTab('training');
+      }
+      setInitialTabSet(true);
+    }
+  }, [session, initialTabSet]);
 
   useEffect(() => { fetchSession(); fetchEvaluatedCount(); }, [fetchSession, fetchEvaluatedCount]);
 
@@ -270,6 +289,26 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
                       </div>
                     </div>
                   )}
+
+                  {isImportMode && (() => {
+                    const cfg = JSON.parse((session as any).config_json || '{}');
+                    return cfg.accepted_dataset ? (
+                      <div className="bg-gray-900 rounded-xl shadow-lg overflow-hidden border border-gray-800 p-4">
+                        <h3 className="text-sm text-teal-400 mb-2">Imported Datasets</h3>
+                        <div className="text-sm text-gray-300 space-y-1">
+                          <p>Accepted: <span className="text-green-400">{cfg.accepted_dataset}</span></p>
+                          <p>Rejected: <span className="text-red-400">{cfg.rejected_dataset}</span></p>
+                          {cfg.import_stats && (
+                            <p className="text-xs text-gray-500 mt-1">
+                              {cfg.import_stats.matched} matched pairs
+                              {cfg.import_stats.unmatched_accepted > 0 && `, ${cfg.import_stats.unmatched_accepted} unmatched accepted`}
+                              {cfg.import_stats.unmatched_rejected > 0 && `, ${cfg.import_stats.unmatched_rejected} unmatched rejected`}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    ) : null;
+                  })()}
 
                   <TrainingConfig
                     onStart={handleStartTraining}

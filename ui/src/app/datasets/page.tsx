@@ -6,7 +6,7 @@ import Link from 'next/link';
 import { TextInput } from '@/components/formInputs';
 import useDatasetList from '@/hooks/useDatasetList';
 import { Button } from '@headlessui/react';
-import { FaRegTrashAlt, FaInfoCircle } from 'react-icons/fa';
+import { FaRegTrashAlt, FaInfoCircle, FaColumns, FaClone, FaFileExport, FaStickyNote } from 'react-icons/fa';
 import { openConfirm } from '@/components/ConfirmModal';
 import { TopBar, MainContent } from '@/components/layout';
 import UniversalTable, { TableColumn } from '@/components/UniversalTable';
@@ -14,6 +14,9 @@ import { apiClient } from '@/utils/api';
 import { useRouter } from 'next/navigation';
 import { Tooltip } from '@/components/Tooltip';
 import { formatDuration } from '@/utils/basic';
+import CompareSelectModal from '@/components/CompareSelectModal';
+import ComfyUIImportModal from '@/components/ComfyUIImportModal';
+import DatasetNotesModal from '@/components/DatasetNotesModal';
 
 interface ImageStats {
   totalCount: number;
@@ -24,53 +27,128 @@ interface ImageStats {
   error?: boolean; // Flag to indicate if there was an error
 }
 
+const DATASET_STATS_CACHE_PREFIX = 'ai-toolkit-dataset-stats:';
+
+function getCachedDatasetStats(datasetName: string): ImageStats | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const cached = localStorage.getItem(DATASET_STATS_CACHE_PREFIX + datasetName);
+    return cached ? (JSON.parse(cached) as ImageStats) : null;
+  } catch {
+    return null;
+  }
+}
+
+function setCachedDatasetStats(datasetName: string, stats: ImageStats): void {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.setItem(DATASET_STATS_CACHE_PREFIX + datasetName, JSON.stringify(stats));
+  } catch {
+    // ignore storage quota errors
+  }
+}
+
+function removeCachedDatasetStats(datasetName: string): void {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.removeItem(DATASET_STATS_CACHE_PREFIX + datasetName);
+  } catch {
+    // ignore errors
+  }
+}
+
 export default function Datasets() {
   const router = useRouter();
   const { datasets, status, refreshDatasets } = useDatasetList();
   const [newDatasetName, setNewDatasetName] = useState('');
   const [isNewDatasetModalOpen, setIsNewDatasetModalOpen] = useState(false);
+  const [isCompareModalOpen, setIsCompareModalOpen] = useState(false);
+  const [isComfyUIImportOpen, setIsComfyUIImportOpen] = useState(false);
+  const [notesDataset, setNotesDataset] = useState<string | null>(null);
+  const [datasetsWithNotes, setDatasetsWithNotes] = useState<Set<string>>(new Set());
   const [imageStats, setImageStats] = useState<{ [datasetName: string]: ImageStats }>({});
   const [statsLoading, setStatsLoading] = useState<{ [datasetName: string]: boolean }>({});
   const requestedDatasets = useRef<Set<string>>(new Set());
 
-  // Fetch image stats for each dataset
+  // Fetch image stats for each dataset; show cached values immediately while refreshing in background.
+  // Use a local queue with a concurrency limit to avoid overwhelming the server.
   useEffect(() => {
     const abortController = new AbortController();
-    
+    const queue: string[] = [];
+    let active = 0;
+    const CONCURRENCY = 3;
+
+    function drain() {
+      if (abortController.signal.aborted) return;
+      while (active < CONCURRENCY && queue.length > 0) {
+        const datasetName = queue.shift();
+        if (!datasetName) break;
+        active++;
+
+        apiClient
+          .get(`/api/datasets/imageStats?datasetName=${encodeURIComponent(datasetName)}`, { signal: abortController.signal })
+          .then(res => res.data)
+          .then((data: ImageStats) => {
+            if (!abortController.signal.aborted) {
+              setCachedDatasetStats(datasetName, data);
+              setImageStats(prev => ({ ...prev, [datasetName]: data }));
+              setStatsLoading(prev => ({ ...prev, [datasetName]: false }));
+            }
+          })
+          .catch(error => {
+            if (!abortController.signal.aborted) {
+              console.error(`Error fetching image stats for ${datasetName}:`, error);
+              // Only overwrite with error state if there is no cached value to fall back to
+              if (!getCachedDatasetStats(datasetName)) {
+                setImageStats(prev => ({
+                  ...prev,
+                  [datasetName]: { totalCount: 0, imageCount: 0, videoCount: 0, totalVideoDuration: 0, resolutionBreakdown: {}, error: true },
+                }));
+              }
+              setStatsLoading(prev => ({ ...prev, [datasetName]: false }));
+            }
+          })
+          .finally(() => {
+            active--;
+            drain();
+          });
+      }
+    }
+
     if (datasets.length > 0) {
       datasets.forEach(datasetName => {
         // Only fetch if we haven't already requested this dataset
         if (!requestedDatasets.current.has(datasetName)) {
           requestedDatasets.current.add(datasetName);
-          setStatsLoading(prev => ({ ...prev, [datasetName]: true }));
-          
-          apiClient
-            .get(`/api/datasets/imageStats?datasetName=${encodeURIComponent(datasetName)}`, { signal: abortController.signal })
-            .then(res => res.data)
-            .then((data: ImageStats) => {
-              if (!abortController.signal.aborted) {
-                setImageStats(prev => ({ ...prev, [datasetName]: data }));
-                setStatsLoading(prev => ({ ...prev, [datasetName]: false }));
-              }
-            })
-            .catch(error => {
-              if (!abortController.signal.aborted) {
-                console.error(`Error fetching image stats for ${datasetName}:`, error);
-                // Set error state so we can show "error fetching stats"
-                setImageStats(prev => ({ 
-                  ...prev, 
-                  [datasetName]: { totalCount: 0, imageCount: 0, videoCount: 0, totalVideoDuration: 0, resolutionBreakdown: {}, error: true } 
-                }));
-                setStatsLoading(prev => ({ ...prev, [datasetName]: false }));
-              }
-            });
+
+          // Show cached stats immediately so the page is usable right away
+          const cached = getCachedDatasetStats(datasetName);
+          if (cached) {
+            setImageStats(prev => ({ ...prev, [datasetName]: cached }));
+          } else {
+            setStatsLoading(prev => ({ ...prev, [datasetName]: true }));
+          }
+
+          queue.push(datasetName);
         }
       });
+      drain();
     }
 
     return () => {
       abortController.abort();
     };
+  }, [datasets]);
+
+  const refreshDatasetsWithNotes = () => {
+    apiClient
+      .get('/api/datasets/notes')
+      .then(res => setDatasetsWithNotes(new Set(res.data.datasetsWithNotes)))
+      .catch(error => console.error('Error fetching datasets with notes:', error));
+  };
+
+  useEffect(() => {
+    refreshDatasetsWithNotes();
   }, [datasets]);
 
   // Transform datasets array into rows with objects
@@ -177,14 +255,38 @@ export default function Datasets() {
     {
       title: 'Actions',
       key: 'actions',
-      className: 'w-20 text-right',
+      className: 'w-40 text-right',
       render: row => (
-        <button
-          className="text-gray-200 hover:bg-red-600 p-2 rounded-full transition-colors"
-          onClick={() => handleDeleteDataset(row.name)}
-        >
-          <FaRegTrashAlt />
-        </button>
+        <div className="flex justify-end gap-1">
+          <button
+            className={`${datasetsWithNotes.has(row.name) ? 'text-yellow-400' : 'text-gray-200'} hover:bg-slate-600 p-2 rounded-full transition-colors`}
+            onClick={() => setNotesDataset(row.name)}
+            title="Notes"
+          >
+            <FaStickyNote />
+          </button>
+          <button
+            className="text-gray-200 hover:bg-slate-600 p-2 rounded-full transition-colors"
+            onClick={() => handleExportToComfyUI(row.name)}
+            title="Export to ComfyUI"
+          >
+            <FaFileExport />
+          </button>
+          <button
+            className="text-gray-200 hover:bg-slate-600 p-2 rounded-full transition-colors"
+            onClick={() => handleCloneDataset(row.name)}
+            title="Clone dataset"
+          >
+            <FaClone />
+          </button>
+          <button
+            className="text-gray-200 hover:bg-red-600 p-2 rounded-full transition-colors"
+            onClick={() => handleDeleteDataset(row.name)}
+            title="Delete dataset"
+          >
+            <FaRegTrashAlt />
+          </button>
+        </div>
       ),
     },
   ];
@@ -200,7 +302,8 @@ export default function Datasets() {
           .post('/api/datasets/delete', { name: datasetName })
           .then(() => {
             console.log('Dataset deleted:', datasetName);
-            // Clear stats for the deleted dataset
+            // Clear stats for the deleted dataset (state and cache)
+            removeCachedDatasetStats(datasetName);
             setImageStats(prev => {
               const newStats = { ...prev };
               delete newStats[datasetName];
@@ -218,6 +321,55 @@ export default function Datasets() {
           .catch(error => {
             console.error('Error deleting dataset:', error);
           });
+      },
+    });
+  };
+
+  const handleCloneDataset = (datasetName: string) => {
+    openConfirm({
+      title: 'Clone Dataset',
+      message: `Enter a name for the cloned copy of "${datasetName}":`,
+      type: 'info',
+      confirmText: 'Clone',
+      inputTitle: 'New dataset name',
+      onConfirm: async (name?: string) => {
+        if (!name) return;
+        try {
+          await apiClient.post('/api/datasets/clone', { source: datasetName, name });
+          refreshDatasets();
+        } catch (error: any) {
+          console.error('Error cloning dataset:', error);
+          openConfirm({
+            title: 'Clone Failed',
+            message: error?.response?.data?.error || 'Failed to clone dataset.',
+            type: 'danger',
+            confirmText: 'OK',
+            onConfirm: () => {},
+          });
+        }
+      },
+    });
+  };
+
+  const handleExportToComfyUI = (datasetName: string) => {
+    openConfirm({
+      title: 'Export to ComfyUI',
+      message: `Export dataset "${datasetName}" to the ComfyUI input directory?`,
+      type: 'info',
+      confirmText: 'Export',
+      onConfirm: async () => {
+        try {
+          await apiClient.post('/api/comfyui/export', { datasetName });
+        } catch (error: any) {
+          console.error('Error exporting to ComfyUI:', error);
+          openConfirm({
+            title: 'Export Failed',
+            message: error?.response?.data?.error || 'Failed to export dataset to ComfyUI.',
+            type: 'danger',
+            confirmText: 'OK',
+            onConfirm: () => {},
+          });
+        }
       },
     });
   };
@@ -269,7 +421,22 @@ export default function Datasets() {
           <h1 className="text-2xl font-semibold text-gray-100">Datasets</h1>
         </div>
         <div className="flex-1"></div>
-        <div>
+        <div className="flex gap-2">
+          {datasets.length >= 2 && (
+            <Button
+              className="text-gray-200 bg-slate-600 px-4 py-2 rounded-md hover:bg-slate-500 transition-colors flex items-center gap-2"
+              onClick={() => setIsCompareModalOpen(true)}
+            >
+              <FaColumns />
+              Compare Datasets
+            </Button>
+          )}
+          <Button
+            className="text-gray-200 bg-slate-600 px-4 py-2 rounded-md hover:bg-slate-500 transition-colors"
+            onClick={() => setIsComfyUIImportOpen(true)}
+          >
+            Import from ComfyUI
+          </Button>
           <Button
             className="text-gray-200 bg-slate-600 px-4 py-2 rounded-md hover:bg-slate-500 transition-colors"
             onClick={() => openNewDatasetModal()}
@@ -321,6 +488,35 @@ export default function Datasets() {
           </form>
         </div>
       </Modal>
+
+      <ComfyUIImportModal
+        isOpen={isComfyUIImportOpen}
+        onClose={() => setIsComfyUIImportOpen(false)}
+        onImportComplete={() => refreshDatasets()}
+      />
+
+      {notesDataset && (
+        <DatasetNotesModal
+          isOpen={true}
+          onClose={() => {
+            setNotesDataset(null);
+            refreshDatasetsWithNotes();
+          }}
+          datasetName={notesDataset}
+        />
+      )}
+
+      <CompareSelectModal
+        isOpen={isCompareModalOpen}
+        onClose={() => setIsCompareModalOpen(false)}
+        mode="dataset"
+        items={datasets.map(d => ({ label: d, value: d }))}
+        onCompare={(left, right, center) => {
+          let url = `/datasets/compare?left=${encodeURIComponent(left)}&right=${encodeURIComponent(right)}`;
+          if (center) url += `&center=${encodeURIComponent(center)}`;
+          router.push(url);
+        }}
+      />
     </>
   );
 }

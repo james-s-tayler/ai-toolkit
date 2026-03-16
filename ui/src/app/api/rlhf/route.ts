@@ -21,7 +21,7 @@ export async function GET() {
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const { name, model_path, comfyui_url, workflow_json, gpu_ids } = body;
+    const { name, model_path, comfyui_url, workflow_json, gpu_ids, dataset_mode } = body;
 
     if (!name?.trim()) {
       return NextResponse.json({ error: 'Name is required' }, { status: 400 });
@@ -37,6 +37,7 @@ export async function POST(request: Request) {
         comfyui_url: comfyui_url?.trim() || 'http://127.0.0.1:9188',
         workflow_json: workflow_json || '',
         gpu_ids: gpu_ids || '0',
+        dataset_mode: dataset_mode === 'import' ? 'import' : 'comfyui',
       },
     });
     return NextResponse.json(session);

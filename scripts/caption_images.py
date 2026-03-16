@@ -14,8 +14,16 @@ import json
 import os
 import gc
 
-MODEL_LITE = "prithivMLmods/Qwen3-VL-4B-Instruct-abliterated-v1"
-MODEL_FULL = "prithivMLmods/Qwen3-VL-8B-Abliterated-Caption-it"
+MODEL_LITE = "Qwen/Qwen3-VL-4B-Instruct"
+MODEL_FULL = "Qwen/Qwen3-VL-8B-Instruct"
+
+ALLOWED_MODELS = {
+    MODEL_LITE,
+    MODEL_FULL,
+    "prithivMLmods/Qwen3-VL-4B-Instruct-abliterated-v1",
+    "prithivMLmods/Qwen3-VL-8B-Abliterated-Caption-it",
+}
+
 
 CORE_CAPTION_INSTRUCTION = (
     "You are a captioning tool. "
@@ -24,6 +32,15 @@ CORE_CAPTION_INSTRUCTION = (
 )
 
 VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.m4v', '.flv', '.webm'}
+
+QUORUM_SYNTHESIS_PROMPT = (
+    "Below are 5 candidate captions for this image. Generate a final caption "
+    "using ONLY details that appear in at least 3 of the 5 candidates. "
+    "Discard any detail that appears in fewer than 3. Write a single cohesive "
+    "caption — do not number items or mention the candidates."
+)
+
+QUORUM_TEMPERATURES = [0.6, 0.7, 0.8, 0.9, 1.0]
 
 
 def get_txt_path(img_path: str) -> str:
@@ -63,7 +80,8 @@ def build_instruction(trigger: str, lora_focus: str) -> str:
     return CORE_CAPTION_INSTRUCTION
 
 
-def generate_caption(model, processor, device, image, instruction: str, trigger: str) -> str:
+def _generate_single(model, processor, device, image, text_instruction, temperature=0.7, greedy=False):
+    """Run a single generation pass and return the decoded caption."""
     from qwen_vl_utils import process_vision_info
     import torch
 
@@ -72,7 +90,7 @@ def generate_caption(model, processor, device, image, instruction: str, trigger:
             "role": "user",
             "content": [
                 {"type": "image", "image": image},
-                {"type": "text", "text": instruction},
+                {"type": "text", "text": text_instruction},
             ],
         }
     ]
@@ -86,36 +104,48 @@ def generate_caption(model, processor, device, image, instruction: str, trigger:
         return_tensors="pt",
     ).to(device)
 
-    with torch.no_grad():
-        gen_ids = model.generate(
-            **inputs,
-            max_new_tokens=1024,
-            do_sample=True,
-            temperature=0.7,
-            top_p=0.9,
-            repetition_penalty=1.12,
-            eos_token_id=processor.tokenizer.eos_token_id,
-        )
+    gen_kwargs = dict(
+        max_new_tokens=1024,
+        repetition_penalty=1.12,
+        eos_token_id=processor.tokenizer.eos_token_id,
+    )
+    if greedy:
+        gen_kwargs.update(do_sample=False)
+    else:
+        gen_kwargs.update(do_sample=True, temperature=temperature, top_p=0.9)
 
-    caption = processor.batch_decode(
+    with torch.no_grad():
+        gen_ids = model.generate(**inputs, **gen_kwargs)
+
+    return processor.batch_decode(
         [g[len(i):] for i, g in zip(inputs.input_ids, gen_ids)],
         skip_special_tokens=True,
     )[0].strip()
 
-    # Retry with greedy decoding if too short or lazy
-    if not caption or len(caption) < 30:
-        with torch.no_grad():
-            gen_ids = model.generate(
-                **inputs,
-                max_new_tokens=512,
-                do_sample=False,
-                repetition_penalty=1.25,
-                eos_token_id=processor.tokenizer.eos_token_id,
-            )
-        caption = processor.batch_decode(
-            [g[len(i):] for i, g in zip(inputs.input_ids, gen_ids)],
-            skip_special_tokens=True,
-        )[0].strip()
+
+def generate_caption(model, processor, device, image, instruction: str, trigger: str, quorum: bool = False) -> str:
+    if quorum:
+        # Generate 5 candidate captions at varying temperatures
+        candidates = []
+        for temp in QUORUM_TEMPERATURES:
+            c = _generate_single(model, processor, device, image, instruction, temperature=temp)
+            if c:
+                candidates.append(c)
+
+        if len(candidates) >= 2:
+            numbered = "\n".join(f"Candidate {i+1}: {c}" for i, c in enumerate(candidates))
+            synthesis_instruction = f"{QUORUM_SYNTHESIS_PROMPT}\n\n{numbered}"
+            if trigger:
+                synthesis_instruction += f"\n\nStart the response with: {trigger}"
+            caption = _generate_single(model, processor, device, image, synthesis_instruction, greedy=True)
+        else:
+            caption = candidates[0] if candidates else ""
+    else:
+        caption = _generate_single(model, processor, device, image, instruction)
+
+        # Retry with greedy decoding if too short or lazy
+        if not caption or len(caption) < 30:
+            caption = _generate_single(model, processor, device, image, instruction, greedy=True)
 
     if not caption:
         caption = (
@@ -136,8 +166,9 @@ def main():
     trigger_word = data.get('trigger_word', '').strip()
     system_prompt = data.get('system_prompt', '').strip()
     model_id = data.get('model_id', MODEL_LITE)
+    quorum = data.get('quorum', False)
 
-    if model_id not in (MODEL_LITE, MODEL_FULL):
+    if model_id not in ALLOWED_MODELS:
         model_id = MODEL_LITE
 
     total = len(image_paths)
@@ -156,6 +187,13 @@ def main():
         sys.exit(1)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # Check if model is already cached
+    try:
+        from huggingface_hub import snapshot_download
+        snapshot_download(model_id, local_files_only=True)
+    except Exception:
+        print('STATUS:downloading', flush=True)
 
     # Load model once for all images
     if device == 'cuda':
@@ -190,7 +228,7 @@ def main():
             else:
                 image = Image.open(img_path).convert('RGB')
 
-            caption = generate_caption(model, processor, device, image, instruction, trigger_word)
+            caption = generate_caption(model, processor, device, image, instruction, trigger_word, quorum=quorum)
 
             txt_path = get_txt_path(img_path)
             with open(txt_path, 'w', encoding='utf-8') as f:
