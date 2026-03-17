@@ -20,13 +20,14 @@ import FilesWidget from '@/components/FilesWidget';
 import useGPUInfo from '@/hooks/useGPUInfo';
 import useCPUInfo from '@/hooks/useCPUInfo';
 
-type TabKey = 'generation' | 'evaluation' | 'config' | 'training' | 'loss_graph' | 'pairs';
+type TabKey = 'generation' | 'evaluation' | 'config' | 'training' | 'samples' | 'loss_graph' | 'pairs';
 
 const allTabs: { key: TabKey; label: string }[] = [
   { key: 'generation', label: 'Generation' },
   { key: 'evaluation', label: 'Evaluation' },
   { key: 'config', label: 'Config' },
   { key: 'training', label: 'Training' },
+  { key: 'samples', label: 'Samples' },
   { key: 'loss_graph', label: 'Loss Graph' },
   { key: 'pairs', label: 'Pairs' },
 ];
@@ -35,6 +36,7 @@ const importTabs: { key: TabKey; label: string }[] = [
   { key: 'evaluation', label: 'Evaluation' },
   { key: 'config', label: 'Config' },
   { key: 'training', label: 'Training' },
+  { key: 'samples', label: 'Samples' },
   { key: 'loss_graph', label: 'Loss Graph' },
   { key: 'pairs', label: 'Pairs' },
 ];
@@ -87,6 +89,11 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
   }, [session?.gpu_ids]);
   const { gpuList, isGPUInfoLoaded } = useGPUInfo(gpuIds, tab === 'training' ? 5000 : null);
   const { cpuInfo, isCPUInfoLoaded } = useCPUInfo(tab === 'training' ? 5000 : null);
+
+  // Sample images state
+  const [sampleImages, setSampleImages] = useState<string[]>([]);
+  const [samplePrompts, setSamplePrompts] = useState<string[]>([]);
+  const [lightboxPath, setLightboxPath] = useState<string | null>(null);
 
   const fetchSession = useCallback(async () => {
     try {
@@ -174,6 +181,17 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
     }
   }, [sessionId, latestRunId]);
 
+  // Fetch sample images
+  const fetchSamples = useCallback(async () => {
+    try {
+      const res = await apiClient.get(`/api/rlhf/${sessionId}/samples`);
+      setSampleImages(res.data.samples ?? []);
+      if (res.data.prompts?.length) setSamplePrompts(res.data.prompts);
+    } catch (e) {
+      // ignore
+    }
+  }, [sessionId]);
+
   const isImportMode = (session as any)?.dataset_mode === 'import';
   const tabs = isImportMode ? importTabs : allTabs;
 
@@ -212,6 +230,17 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
     const timer = setInterval(fetchRunStatus, 3000);
     return () => clearInterval(timer);
   }, [latestRunId, latestRunStatus, fetchRunStatus]);
+
+  const isTrainingActive = latestRunStatus === 'running' || latestRunStatus === 'paused';
+
+  // Poll sample images every 5s when on samples tab and training is active
+  useEffect(() => {
+    if (tab !== 'samples') return;
+    fetchSamples();
+    if (!isTrainingActive) return;
+    const timer = setInterval(fetchSamples, 5000);
+    return () => clearInterval(timer);
+  }, [tab, isTrainingActive, fetchSamples]);
 
   useEffect(() => {
     if (tab === 'pairs') fetchPairs(pairsPage, pairsFilter, prefFilter);
@@ -428,6 +457,129 @@ export default function SessionPage({ params }: { params: { sessionId: string } 
                   </div>
                   <FilesWidget apiUrl={`/api/rlhf/${sessionId}/files`} />
                 </div>
+              </div>
+            )}
+
+            {tab === 'samples' && (
+              <div className="space-y-4">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-sm text-gray-300">
+                    Sample Previews ({sampleImages.length} images)
+                  </h3>
+                  {isTrainingActive && (
+                    <span className="text-xs text-gray-500">Auto-refreshing every 5s</span>
+                  )}
+                </div>
+                {sampleImages.length === 0 ? (
+                  <div className="bg-gray-900 rounded-xl p-8 text-center border border-gray-800">
+                    <p className="text-gray-500">No sample images yet.</p>
+                    <p className="text-gray-600 text-xs mt-1">
+                      Configure sample_every &gt; 0 with sample prompts in the Config tab to enable preview generation during training.
+                    </p>
+                  </div>
+                ) : (
+                  <div className={`grid gap-4`} style={{ gridTemplateColumns: `repeat(${Math.max(samplePrompts.length, 1)}, minmax(0, 1fr))` }}>
+                    {sampleImages.map((imgPath) => {
+                      const filename = imgPath.split('/').pop() ?? '';
+                      const stepMatch = filename.match(/^(\d+)_(\d+)\./);
+                      const step = stepMatch ? parseInt(stepMatch[1]) : 0;
+                      const pIdx = stepMatch ? parseInt(stepMatch[2]) : 0;
+                      const prompt = samplePrompts[pIdx] ?? '';
+                      return (
+                        <div
+                          key={imgPath}
+                          className="bg-gray-900 rounded-lg overflow-hidden border border-gray-800 cursor-pointer hover:border-gray-600 transition-colors"
+                          onClick={() => setLightboxPath(imgPath)}
+                        >
+                          {/* eslint-disable-next-line @next/next/no-img-element */}
+                          <img
+                            src={`/api/img/${encodeURIComponent(imgPath)}`}
+                            alt={filename}
+                            className="w-full aspect-square object-cover"
+                          />
+                          <div className="px-2 py-1.5">
+                            <div className="text-xs text-gray-500">Step {step.toLocaleString()}</div>
+                            {prompt && <div className="text-xs text-gray-400 truncate mt-0.5" title={prompt}>{prompt}</div>}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* Lightbox */}
+                {lightboxPath && (() => {
+                  const filename = lightboxPath.split('/').pop() ?? '';
+                  const stepMatch = filename.match(/^(\d+)_(\d+)\./);
+                  const step = stepMatch ? parseInt(stepMatch[1]) : 0;
+                  const pIdx = stepMatch ? parseInt(stepMatch[2]) : 0;
+                  const prompt = samplePrompts[pIdx] ?? '';
+                  const currentIndex = sampleImages.indexOf(lightboxPath);
+
+                  const navigate = (dir: number) => {
+                    const next = currentIndex + dir;
+                    if (next >= 0 && next < sampleImages.length) setLightboxPath(sampleImages[next]);
+                  };
+
+                  return (
+                    <div
+                      className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center"
+                      onClick={() => setLightboxPath(null)}
+                      onKeyDown={e => {
+                        if (e.key === 'Escape') setLightboxPath(null);
+                        if (e.key === 'ArrowLeft') navigate(-1);
+                        if (e.key === 'ArrowRight') navigate(1);
+                        if (e.key === 'ArrowUp') navigate(-(samplePrompts.length || 1));
+                        if (e.key === 'ArrowDown') navigate(samplePrompts.length || 1);
+                      }}
+                      tabIndex={0}
+                      ref={el => el?.focus()}
+                    >
+                      <div
+                        className="relative max-w-[95vw] max-h-[95vh] flex flex-col bg-gray-800 rounded-lg overflow-hidden"
+                        onClick={e => e.stopPropagation()}
+                      >
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                          src={`/api/img/${encodeURIComponent(lightboxPath)}`}
+                          alt={filename}
+                          className="max-w-[95vw] max-h-[82vh] object-contain"
+                        />
+                        <div className="bg-gray-950 px-4 py-2 flex justify-between items-center gap-4">
+                          <div className="flex-1 min-w-0">
+                            {prompt && (
+                              <div className="text-sm">
+                                <span className="text-gray-400 mr-1">Prompt:</span>
+                                <span className="whitespace-pre-wrap break-words">{prompt}</span>
+                              </div>
+                            )}
+                          </div>
+                          <div className="text-xs text-right flex-shrink-0">
+                            <div><span className="text-gray-400">Step:</span> {step.toLocaleString()}</div>
+                            <div><span className="text-gray-400">Prompt #:</span> {pIdx + 1}</div>
+                          </div>
+                        </div>
+                        {/* Nav arrows */}
+                        {currentIndex > 0 && (
+                          <button
+                            className="absolute left-2 top-1/2 -translate-y-1/2 bg-black/50 hover:bg-black/80 text-white rounded-full w-8 h-8 flex items-center justify-center"
+                            onClick={() => navigate(-1)}
+                          >
+                            &#8592;
+                          </button>
+                        )}
+                        {currentIndex < sampleImages.length - 1 && (
+                          <button
+                            className="absolute right-2 top-1/2 -translate-y-1/2 bg-black/50 hover:bg-black/80 text-white rounded-full w-8 h-8 flex items-center justify-center"
+                            onClick={() => navigate(1)}
+                          >
+                            &#8594;
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })()}
               </div>
             )}
 

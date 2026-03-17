@@ -77,7 +77,6 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--max_train_steps", type=int, default=2000)
     parser.add_argument("--lora_rank", type=int, default=16)
-    parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--blocks_to_swap", type=int, default=16)
     parser.add_argument("--mixed_precision", type=str, default="bf16",
                         choices=["no", "fp16", "bf16"])
@@ -90,6 +89,21 @@ def parse_args():
                         help="Quantize base model weights (qfloat8 = FP8, auto-converts to torchao float8 when block swapping)")
     parser.add_argument("--control_file", type=str, default="",
                         help="Path to control.json for pause/resume/stop signalling")
+
+    # Sample preview generation
+    parser.add_argument("--sample_every", type=int, default=0,
+                        help="Generate sample images every N steps (0 = disabled)")
+    parser.add_argument("--sample_steps", type=int, default=25,
+                        help="Number of inference steps for sample generation")
+    parser.add_argument("--sample_guidance_scale", type=float, default=3.0,
+                        help="CFG guidance scale for sample generation")
+    parser.add_argument("--sample_width", type=int, default=1024)
+    parser.add_argument("--sample_height", type=int, default=1024)
+    parser.add_argument("--sample_seed", type=int, default=42)
+    parser.add_argument("--sample_prompts_file", type=str, default="",
+                        help="Path to JSON file containing array of prompt strings for sampling")
+    parser.add_argument("--skip_first_sample", action="store_true",
+                        help="Skip generating baseline samples before training starts")
     return parser.parse_args()
 
 
@@ -584,6 +598,192 @@ def compute_dpo_loss(
 
 
 # ---------------------------------------------------------------------------
+# Sample preview generation
+# ---------------------------------------------------------------------------
+
+def generate_samples(
+    transformer,
+    lora_network,
+    sample_embed_cache: dict,
+    sample_prompts: list,
+    step: int,
+    output_dir: str,
+    vae_path: str,
+    num_steps: int = 25,
+    guidance_scale: float = 3.0,
+    width: int = 1024,
+    height: int = 1024,
+    seed: int = 42,
+    dtype=torch.bfloat16,
+    device: str = "cuda",
+    status_file: str = "",
+    total_steps: int = 0,
+    running_loss: float = 0.0,
+):
+    """Generate sample preview images using the current LoRA weights.
+
+    Uses Euler discrete sampling with the shifted flow-matching schedule.
+    VAE is loaded temporarily for decoding, then unloaded to free VRAM.
+    """
+    samples_dir = os.path.join(output_dir, "samples")
+    os.makedirs(samples_dir, exist_ok=True)
+
+    # Write sampling status
+    if status_file:
+        write_status(status_file, step, total_steps, running_loss, "sampling")
+
+    # Set LoRA to policy mode and switch to eval
+    lora_network.set_multiplier(1.0)
+    transformer.eval()
+
+    latent_h = height // ZIMAGE_VAE_SCALE_FACTOR
+    latent_w = width // ZIMAGE_VAE_SCALE_FACTOR
+    latent_c = 16  # Z-Image latent channels
+
+    # Build sigma schedule: linearly space num_steps+1 values from 1→0
+    # Then apply shift: shifted = shift * s / (1 + (shift-1) * s)
+    sigmas_unshifted = torch.linspace(1.0, 0.0, num_steps + 1)
+    sigmas_shifted = ZIMAGE_SCHEDULER_SHIFT * sigmas_unshifted / (1 + (ZIMAGE_SCHEDULER_SHIFT - 1) * sigmas_unshifted)
+
+    # Get negative embedding for CFG if needed
+    neg_embed = None
+    if guidance_scale > 1.0 and "" in sample_embed_cache:
+        neg_embed = sample_embed_cache[""]
+
+    denoised_latents = []
+
+    print(f"\n[rlhf] ==== GENERATING SAMPLES at step {step} ====")
+    print(f"[rlhf]   {len(sample_prompts)} prompts, {num_steps} steps, cfg={guidance_scale}, "
+          f"{width}x{height}, seed={seed}")
+
+    # Diagnostic: check LoRA weights for NaN/Inf
+    lora_nan = False
+    for name, param in lora_network.named_parameters():
+        if torch.isnan(param).any() or torch.isinf(param).any():
+            print(f"[rlhf]   WARNING: NaN/Inf detected in LoRA param {name}!")
+            lora_nan = True
+    if lora_nan:
+        print(f"[rlhf]   ABORTING sample generation due to NaN/Inf in LoRA weights")
+        transformer.train()
+        if status_file:
+            write_status(status_file, step, total_steps, running_loss, "running")
+        return
+    else:
+        # Log LoRA weight magnitude for training diagnostics
+        lora_norms = []
+        for name, param in lora_network.named_parameters():
+            if param.requires_grad:
+                lora_norms.append(param.data.float().norm().item())
+        if lora_norms:
+            avg_norm = sum(lora_norms) / len(lora_norms)
+            max_norm = max(lora_norms)
+            print(f"[rlhf]   LoRA weights OK — avg_norm={avg_norm:.6f}, max_norm={max_norm:.6f}")
+
+    with torch.no_grad():
+        for prompt_idx, prompt in enumerate(sample_prompts):
+            emb_data = sample_embed_cache.get(prompt)
+            if emb_data is None:
+                print(f"[rlhf]   Skipping prompt {prompt_idx} (no embedding): {prompt[:60]}")
+                continue
+
+            embed = emb_data["embed"].to(device, dtype=dtype)
+            mask = emb_data["mask"]
+            # Trim to actual length
+            actual_len = int(mask.sum(dim=1).item())
+            embed = embed[:, :actual_len, :]
+
+            # Start from random noise with deterministic seed
+            generator = torch.Generator(device=device).manual_seed(seed + prompt_idx)
+            latents = torch.randn(1, latent_c, latent_h, latent_w, generator=generator,
+                                  device=device, dtype=dtype)
+
+            # Euler discrete sampling loop
+            for i in range(num_steps):
+                sigma = sigmas_shifted[i]
+                sigma_next = sigmas_shifted[i + 1]
+
+                # Timestep input: (1 - sigma_shifted) — the pipeline computes
+                # timestep = (1000 - t) / 1000 where t = sigma_shifted * 1000
+                t_input = (1.0 - sigma).to(device, dtype=dtype).unsqueeze(0)
+
+                # Prepare transformer input: add frame dimension
+                latent_input = [latents[0].unsqueeze(1)]  # [(C, 1, H, W)]
+                cap_feats = [embed[0]]  # [(seq_len, dim)]
+
+                # Forward pass — raw output predicts (data − noise).
+                # Pipeline negates before scheduler step (pipeline_z_image.py:558).
+                out = transformer(x=latent_input, t=t_input, cap_feats=cap_feats, return_dict=False)
+                pred = out[0][0].squeeze(1).unsqueeze(0)  # (1, C, H, W)
+
+                # CFG: pipeline uses cond + scale * (cond - uncond)
+                if guidance_scale > 1.0 and neg_embed is not None:
+                    neg_e = neg_embed["embed"].to(device, dtype=dtype)
+                    neg_m = neg_embed["mask"]
+                    neg_len = int(neg_m.sum(dim=1).item())
+                    neg_e = neg_e[:, :neg_len, :]
+                    neg_input = [latents[0].unsqueeze(1)]
+                    neg_cap = [neg_e[0]]
+                    out_neg = transformer(x=neg_input, t=t_input, cap_feats=neg_cap, return_dict=False)
+                    pred_neg = out_neg[0][0].squeeze(1).unsqueeze(0)
+                    pred = pred + guidance_scale * (pred - pred_neg)
+
+                # Negate (matches pipeline_z_image.py:558) then Euler step
+                velocity = -pred
+                dt = (sigma_next - sigma).to(device, dtype=dtype)
+                latents = latents + dt * velocity
+
+                # Diagnostic: log stats at first, middle, and last step
+                if i == 0 or i == num_steps // 2 or i == num_steps - 1:
+                    lat_min, lat_max = latents.min().item(), latents.max().item()
+                    lat_nan = torch.isnan(latents).any().item()
+                    pred_nan = torch.isnan(pred).any().item()
+                    print(f"[rlhf]     step {i}/{num_steps}: sigma={sigma:.4f} "
+                          f"latent=[{lat_min:.3f}, {lat_max:.3f}] "
+                          f"nan_lat={lat_nan} nan_pred={pred_nan}")
+
+            denoised_latents.append(latents.cpu())
+            print(f"[rlhf]   Prompt {prompt_idx}: denoised ({prompt[:50]})")
+
+    # Load VAE temporarily for decoding
+    if denoised_latents:
+        # Free cached GPU memory before loading VAE
+        gc.collect()
+        torch.cuda.empty_cache()
+        log_vram("before VAE load for decode")
+
+        print(f"[rlhf]   Loading VAE for decode...")
+        from diffusers import AutoencoderKL
+        vae = AutoencoderKL.from_pretrained(vae_path, subfolder="vae", torch_dtype=torch.float32)
+        vae = vae.to(device)
+        vae.eval()
+
+        with torch.no_grad():
+            for prompt_idx, latent in enumerate(denoised_latents):
+                latent = latent.to(device, dtype=torch.float32)
+                # Reverse Z-Image scaling: latent / scale + shift
+                latent = latent / ZIMAGE_VAE_SCALING_FACTOR + ZIMAGE_VAE_SHIFT_FACTOR
+                decoded = vae.decode(latent, return_dict=False)[0]
+                # Clamp to [0, 1] and save
+                img = decoded.squeeze(0).clamp(-1, 1).permute(1, 2, 0).cpu().float()
+                img = ((img + 1) / 2 * 255).clamp(0, 255).byte().numpy()
+                img_pil = Image.fromarray(img)
+                img_path = os.path.join(samples_dir, f"{step:06d}_{prompt_idx:02d}.jpg")
+                img_pil.save(img_path, quality=90)
+                print(f"[rlhf]   Saved {os.path.basename(img_path)}")
+
+        del vae
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(f"[rlhf]   VAE unloaded")
+
+    # Restore training state
+    transformer.train()
+    if status_file:
+        write_status(status_file, step, total_steps, running_loss, "running")
+    print(f"[rlhf] ==== SAMPLES COMPLETE ====\n")
+
+
+# ---------------------------------------------------------------------------
 # Main training loop
 # ---------------------------------------------------------------------------
 
@@ -656,7 +856,6 @@ def main():
     print(f"[rlhf]   learning_rate     = {args.learning_rate:.2e}")
     print(f"[rlhf]   max_train_steps   = {args.max_train_steps}")
     print(f"[rlhf]   lora_rank         = {args.lora_rank}")
-    print(f"[rlhf]   batch_size        = {args.batch_size}")
     print(f"[rlhf]   blocks_to_swap    = {args.blocks_to_swap}")
     print(f"[rlhf]   save_every        = {args.save_every}")
     print(f"[rlhf]   status_every      = {args.status_every}")
@@ -665,6 +864,13 @@ def main():
     print(f"[rlhf]   grad_checkpointing= {args.gradient_checkpointing}")
     print(f"[rlhf]   quantize          = {args.quantize}")
     print(f"[rlhf]   control_file      = {args.control_file or '(none)'}")
+    print(f"[rlhf]   sample_every      = {args.sample_every}")
+    if args.sample_every > 0:
+        print(f"[rlhf]   sample_steps      = {args.sample_steps}")
+        print(f"[rlhf]   sample_cfg        = {args.sample_guidance_scale}")
+        print(f"[rlhf]   sample_size       = {args.sample_width}x{args.sample_height}")
+        print(f"[rlhf]   sample_seed       = {args.sample_seed}")
+        print(f"[rlhf]   sample_prompts    = {args.sample_prompts_file or '(none)'}")
 
     # -------------------------------------------------------------------
     # Hardware info
@@ -712,13 +918,27 @@ def main():
     prompts = [p["prompt"] for p in preferences]
     cache_dir = args.cache_dir if args.cache_dir else os.path.join(args.output_dir, "cache")
 
+    # Load sample prompts if configured
+    sample_prompts_list = []
+    if args.sample_every > 0 and args.sample_prompts_file and os.path.exists(args.sample_prompts_file):
+        with open(args.sample_prompts_file) as f:
+            sample_prompts_list = json.load(f)
+        print(f"[rlhf] Loaded {len(sample_prompts_list)} sample prompts for preview generation")
+
+    # Merge sample prompts (+ empty string for CFG) into the set to encode
+    all_prompts_to_encode = list(prompts)
+    if sample_prompts_list:
+        all_prompts_to_encode.extend(sample_prompts_list)
+        if args.sample_guidance_scale > 1.0:
+            all_prompts_to_encode.append("")  # negative/unconditional embedding for CFG
+
     latents_fully_cached = all_latents_cached(all_image_paths, cache_dir)
-    embeddings_fully_cached = all_embeddings_cached(prompts, cache_dir)
+    embeddings_fully_cached = all_embeddings_cached(all_prompts_to_encode, cache_dir)
 
     if latents_fully_cached:
         print(f"[rlhf] All {len(set(all_image_paths))} latents found in cache — skipping VAE load")
     if embeddings_fully_cached:
-        print(f"[rlhf] All {len(set(prompts))} embeddings found in cache — skipping text encoder load")
+        print(f"[rlhf] All {len(set(all_prompts_to_encode))} embeddings found in cache — skipping text encoder load")
 
     # -----------------------------------------------------------------------
     # Resolve model path (needed for all loading)
@@ -775,10 +995,10 @@ def main():
     write_status(args.status_file, 0, args.max_train_steps, 0.0, "caching_embeddings")
 
     if embeddings_fully_cached:
-        print(f"[rlhf] Loading {len(set(prompts))} embeddings from cache...")
-        embed_cache = load_embeddings_from_cache(prompts, cache_dir)
+        print(f"[rlhf] Loading {len(set(all_prompts_to_encode))} embeddings from cache...")
+        all_embed_cache = load_embeddings_from_cache(all_prompts_to_encode, cache_dir)
     else:
-        print(f"[rlhf] Encoding {len(set(prompts))} unique prompts with Qwen3...")
+        print(f"[rlhf] Encoding {len(set(all_prompts_to_encode))} unique prompts with Qwen3...")
         try:
             text_encoder = Qwen3ForCausalLM.from_pretrained(
                 model_path, subfolder="text_encoder", torch_dtype=dtype
@@ -789,16 +1009,27 @@ def main():
             text_encoder = text_encoder.to(device)
             text_encoder.eval()
             log_vram("text encoder on GPU")
-            embed_cache = encode_prompts(tokenizer, text_encoder, prompts, device, cache_dir)
+            all_embed_cache = encode_prompts(tokenizer, text_encoder, all_prompts_to_encode, device, cache_dir)
         finally:
             del text_encoder, tokenizer
             gc.collect()
             torch.cuda.empty_cache()
             log_vram("after text encoder unload")
 
+    # Split into training embed_cache and sample_embed_cache
+    embed_cache = {p: all_embed_cache[p] for p in set(prompts) if p in all_embed_cache}
+    sample_embed_cache = {}
+    if sample_prompts_list:
+        for p in sample_prompts_list:
+            if p in all_embed_cache:
+                sample_embed_cache[p] = all_embed_cache[p]
+        if "" in all_embed_cache:
+            sample_embed_cache[""] = all_embed_cache[""]
+        print(f"[rlhf]   Sample embed cache: {len(sample_embed_cache)} entries")
+
     sample_emb = next(iter(embed_cache.values()))
     print(f"[rlhf]   Embedding shape: {list(sample_emb['embed'].shape)}, dtype={sample_emb['embed'].dtype}")
-    print(f"[rlhf]   {len(embed_cache)} embeddings ready in {time.time() - t0:.1f}s")
+    print(f"[rlhf]   {len(embed_cache)} training embeddings ready in {time.time() - t0:.1f}s")
     print("-" * 70)
 
     # -----------------------------------------------------------------------
@@ -1033,12 +1264,55 @@ def main():
     # -----------------------------------------------------------------------
     # Training loop
     # -----------------------------------------------------------------------
+
+    # Clear stale samples from previous training runs in this session
+    samples_dir = os.path.join(args.output_dir, "samples")
+    if os.path.isdir(samples_dir):
+        import glob as glob_mod
+        old_samples = glob_mod.glob(os.path.join(samples_dir, "*.jpg"))
+        if old_samples:
+            for f in old_samples:
+                os.remove(f)
+            print(f"[rlhf] Cleared {len(old_samples)} stale sample images from previous run")
+
     print(f"[rlhf] Starting training for {args.max_train_steps} steps")
     print(f"[rlhf]   Save checkpoints every {args.save_every} steps")
     print(f"[rlhf]   Verbose log every step")
     write_status(args.status_file, 0, args.max_train_steps, 0.0, "running")
     running_loss = 0.0
     control_file = args.control_file
+
+    # Generate baseline samples before training (step 0)
+    if args.sample_every > 0 and sample_prompts_list and not args.skip_first_sample:
+        print(f"[rlhf] Generating baseline samples before training")
+        try:
+            generate_samples(
+                transformer=transformer,
+                lora_network=lora_network,
+                sample_embed_cache=sample_embed_cache,
+                sample_prompts=sample_prompts_list,
+                step=0,
+                output_dir=args.output_dir,
+                vae_path=model_path,
+                num_steps=args.sample_steps,
+                guidance_scale=args.sample_guidance_scale,
+                width=args.sample_width,
+                height=args.sample_height,
+                seed=args.sample_seed,
+                dtype=dtype,
+                device=device,
+                status_file=args.status_file,
+                total_steps=args.max_train_steps,
+                running_loss=0.0,
+            )
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print(f"[rlhf] WARNING: OOM during initial sample generation, skipping", file=sys.stderr)
+                torch.cuda.empty_cache()
+            else:
+                print(f"[rlhf] WARNING: Initial sample generation failed: {e}", file=sys.stderr)
+    elif args.skip_first_sample and args.sample_every > 0 and sample_prompts_list:
+        print(f"[rlhf] Skipping first sample (skip_first_sample=True)")
 
     # Timing accumulators
     step_times = []
@@ -1139,6 +1413,13 @@ def main():
             # Gradient norm (before clipping)
             grad_norm_raw = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
 
+            # NaN detection: skip optimizer step if loss or gradients are NaN
+            loss_val_check = loss.item()
+            if math.isnan(loss_val_check) or math.isinf(loss_val_check):
+                print(f"[rlhf] WARNING: NaN/Inf loss at step {step} (loss={loss_val_check}), skipping optimizer step")
+                optimizer.zero_grad()
+                continue
+
             # Optimizer step
             t_opt = time.time()
             optimizer.step()
@@ -1201,6 +1482,38 @@ def main():
               f"step={avg_step_time:.3f}s")
 
         append_loss_log(args.output_dir, step, running_loss)
+
+        # Sample preview generation
+        if args.sample_every > 0 and sample_prompts_list and step % args.sample_every == 0:
+            try:
+                # Free gradient tensors and GPU cache before sampling
+                optimizer.zero_grad()
+                torch.cuda.empty_cache()
+                generate_samples(
+                    transformer=transformer,
+                    lora_network=lora_network,
+                    sample_embed_cache=sample_embed_cache,
+                    sample_prompts=sample_prompts_list,
+                    step=step,
+                    output_dir=args.output_dir,
+                    vae_path=model_path,
+                    num_steps=args.sample_steps,
+                    guidance_scale=args.sample_guidance_scale,
+                    width=args.sample_width,
+                    height=args.sample_height,
+                    seed=args.sample_seed,
+                    dtype=dtype,
+                    device=device,
+                    status_file=args.status_file,
+                    total_steps=args.max_train_steps,
+                    running_loss=running_loss,
+                )
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    print(f"[rlhf] WARNING: OOM during sample generation, skipping", file=sys.stderr)
+                    torch.cuda.empty_cache()
+                else:
+                    print(f"[rlhf] WARNING: Sample generation failed: {e}", file=sys.stderr)
 
         # VRAM logging every 100 steps
         if step % 100 == 0:

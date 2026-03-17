@@ -7,12 +7,19 @@ export interface TrainingParams {
   learning_rate: number;
   max_train_steps: number;
   lora_rank: number;
-  batch_size: number;
   blocks_to_swap: number;
   save_every: number;
   mixed_precision: string;
   gradient_checkpointing: boolean;
   quantize: string;
+  sample_every: number;
+  sample_steps: number;
+  sample_guidance_scale: number;
+  sample_width: number;
+  sample_height: number;
+  sample_seed: number;
+  sample_prompts: string[];
+  skip_first_sample: boolean;
 }
 
 export const DEFAULT_TRAINING_PARAMS: TrainingParams = {
@@ -20,12 +27,19 @@ export const DEFAULT_TRAINING_PARAMS: TrainingParams = {
   learning_rate: 1e-5,
   max_train_steps: 2000,
   lora_rank: 16,
-  batch_size: 1,
   blocks_to_swap: 16,
   save_every: 250,
   mixed_precision: 'bf16',
   gradient_checkpointing: true,
   quantize: 'none',
+  sample_every: 0,
+  sample_steps: 25,
+  sample_guidance_scale: 3.0,
+  sample_width: 1024,
+  sample_height: 1024,
+  sample_seed: 42,
+  sample_prompts: [],
+  skip_first_sample: false,
 };
 
 interface Props {
@@ -37,10 +51,10 @@ interface Props {
 }
 
 export default function TrainingConfig({ onStartTraining, initialConfig, evaluatedCount, isStarting, disabled }: Props) {
-  const [params, setParams] = useState<TrainingParams>(initialConfig ?? DEFAULT_TRAINING_PARAMS);
+  const [params, setParams] = useState<TrainingParams>({ ...DEFAULT_TRAINING_PARAMS, ...initialConfig });
 
   useEffect(() => {
-    if (initialConfig) setParams(initialConfig);
+    if (initialConfig) setParams(prev => ({ ...DEFAULT_TRAINING_PARAMS, ...initialConfig }));
   }, [initialConfig]);
 
   const setParam = (key: keyof TrainingParams) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
@@ -87,10 +101,6 @@ export default function TrainingConfig({ onStartTraining, initialConfig, evaluat
           <input type="number" value={params.lora_rank} onChange={setParam('lora_rank')} disabled={disabled} className={fieldClass} />
         </div>
         <div>
-          <label className={labelClass}>Batch Size</label>
-          <input type="number" value={params.batch_size} onChange={setParam('batch_size')} min={1} disabled={disabled} className={fieldClass} />
-        </div>
-        <div>
           <label className={labelClass}>Blocks to Swap (CPU)</label>
           <input type="number" value={params.blocks_to_swap} onChange={setParam('blocks_to_swap')} min={0} disabled={disabled} className={fieldClass} />
         </div>
@@ -118,6 +128,88 @@ export default function TrainingConfig({ onStartTraining, initialConfig, evaluat
             <input type="checkbox" checked={params.gradient_checkpointing} onChange={setParam('gradient_checkpointing')} disabled={disabled} className="w-4 h-4" />
             Gradient Checkpointing
           </label>
+        </div>
+      </div>
+
+      {/* Sample Preview Section */}
+      <div className="border-t border-gray-700 pt-4 mt-4">
+        <h3 className="text-sm text-gray-300 mb-2">Sample Preview</h3>
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <label className={labelClass}>Sample Every N Steps (0 = off)</label>
+            <input type="number" value={params.sample_every} onChange={setParam('sample_every')} min={0} disabled={disabled} className={fieldClass} />
+          </div>
+          <div>
+            <label className={labelClass}>Sample Steps</label>
+            <input type="number" value={params.sample_steps} onChange={setParam('sample_steps')} min={1} disabled={disabled} className={fieldClass} />
+          </div>
+          <div>
+            <label className={labelClass}>Guidance Scale</label>
+            <input type="number" step="0.1" value={params.sample_guidance_scale} onChange={setParam('sample_guidance_scale')} min={1} disabled={disabled} className={fieldClass} />
+          </div>
+          <div>
+            <label className={labelClass}>Seed</label>
+            <input type="number" value={params.sample_seed} onChange={setParam('sample_seed')} disabled={disabled} className={fieldClass} />
+          </div>
+          <div>
+            <label className={labelClass}>Width</label>
+            <input type="number" value={params.sample_width} onChange={setParam('sample_width')} min={256} step={16} disabled={disabled} className={fieldClass} />
+          </div>
+          <div>
+            <label className={labelClass}>Height</label>
+            <input type="number" value={params.sample_height} onChange={setParam('sample_height')} min={256} step={16} disabled={disabled} className={fieldClass} />
+          </div>
+        </div>
+
+        {/* Sample Prompts */}
+        <div className="mt-3">
+          <label className={labelClass}>Sample Prompts ({params.sample_prompts.length})</label>
+          {params.sample_prompts.map((prompt, i) => (
+            <div key={i} className="flex gap-2 mb-2">
+              <input
+                type="text"
+                value={prompt}
+                onChange={e => {
+                  const updated = [...params.sample_prompts];
+                  updated[i] = e.target.value;
+                  setParams(prev => ({ ...prev, sample_prompts: updated }));
+                }}
+                placeholder="Enter prompt"
+                disabled={disabled}
+                className={fieldClass}
+              />
+              <button
+                type="button"
+                onClick={() => setParams(prev => ({
+                  ...prev,
+                  sample_prompts: prev.sample_prompts.filter((_, idx) => idx !== i),
+                }))}
+                disabled={disabled}
+                className="text-gray-500 hover:text-red-400 px-2 text-sm"
+              >
+                X
+              </button>
+            </div>
+          ))}
+          <button
+            type="button"
+            onClick={() => setParams(prev => ({
+              ...prev,
+              sample_prompts: [...prev.sample_prompts, ''],
+            }))}
+            disabled={disabled}
+            className="w-full px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded-sm text-sm text-gray-300 transition-colors"
+          >
+            Add Prompt
+          </button>
+        </div>
+
+        <div className="mt-3">
+          <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+            <input type="checkbox" checked={params.skip_first_sample} onChange={setParam('skip_first_sample')} disabled={disabled} className="w-4 h-4" />
+            Skip First Sample
+          </label>
+          <p className="text-xs text-gray-500 mt-1 ml-6">By default, baseline samples are generated before training starts. Check this to skip them.</p>
         </div>
       </div>
 

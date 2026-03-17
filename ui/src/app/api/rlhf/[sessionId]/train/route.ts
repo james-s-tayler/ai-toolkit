@@ -45,12 +45,19 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       learning_rate = 1e-5,
       max_train_steps = 2000,
       lora_rank = 16,
-      batch_size = 1,
       blocks_to_swap = 16,
       save_every = 250,
       mixed_precision = 'bf16',
       gradient_checkpointing = true,
       quantize = 'none',
+      sample_every = 0,
+      sample_steps = 25,
+      sample_guidance_scale = 3.0,
+      sample_width = 1024,
+      sample_height = 1024,
+      sample_seed = 42,
+      sample_prompts = [] as string[],
+      skip_first_sample = false,
     } = body;
 
     const session = await prisma.rlhfSession.findUnique({ where: { id: sessionId } });
@@ -96,13 +103,27 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       learning_rate,
       max_train_steps,
       lora_rank,
-      batch_size,
       blocks_to_swap,
       save_every,
       mixed_precision,
       gradient_checkpointing,
       quantize,
+      sample_every,
+      sample_steps,
+      sample_guidance_scale,
+      sample_width,
+      sample_height,
+      sample_seed,
+      sample_prompts,
+      skip_first_sample,
     };
+
+    // Write sample prompts file if sampling is enabled
+    let samplePromptsPath = '';
+    if (sample_every > 0 && sample_prompts.length > 0) {
+      samplePromptsPath = path.join(outputDir, 'sample_prompts.json');
+      fs.writeFileSync(samplePromptsPath, JSON.stringify(sample_prompts));
+    }
 
     const run = await prisma.rlhfTrainingRun.create({
       data: {
@@ -134,7 +155,6 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       '--learning_rate', String(learning_rate),
       '--max_train_steps', String(max_train_steps),
       '--lora_rank', String(lora_rank),
-      '--batch_size', String(batch_size),
       '--blocks_to_swap', String(blocks_to_swap),
       '--mixed_precision', mixed_precision,
       '--save_every', String(save_every),
@@ -143,6 +163,21 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     ];
 
     if (gradient_checkpointing) args.push('--gradient_checkpointing');
+
+    if (sample_every > 0) {
+      args.push('--sample_every', String(sample_every));
+      args.push('--sample_steps', String(sample_steps));
+      args.push('--sample_guidance_scale', String(sample_guidance_scale));
+      args.push('--sample_width', String(sample_width));
+      args.push('--sample_height', String(sample_height));
+      args.push('--sample_seed', String(sample_seed));
+      if (samplePromptsPath) {
+        args.push('--sample_prompts_file', samplePromptsPath);
+      }
+      if (skip_first_sample) {
+        args.push('--skip_first_sample');
+      }
+    }
 
     const additionalEnv: Record<string, string> = {
       CUDA_DEVICE_ORDER: 'PCI_BUS_ID',
