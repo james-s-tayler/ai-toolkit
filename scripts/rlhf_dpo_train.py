@@ -45,7 +45,7 @@ from torchvision import transforms
 
 
 # ---------------------------------------------------------------------------
-# Z-Image constants (from musubi-tuner zimage_config)
+# Z-Image constants
 # ---------------------------------------------------------------------------
 ZIMAGE_HF_ID = "Tongyi-MAI/Z-Image"
 ZIMAGE_VAE_SCALING_FACTOR = 0.3611
@@ -133,18 +133,20 @@ def append_loss_log(output_dir: str, step: int, loss: float):
 
 
 def save_lora_weights(lora_network, ckpt_dir: str, dtype):
-    """Save only the LoRA weights (not the frozen base model weights) as safetensors."""
-    if hasattr(lora_network, 'save_weights'):
-        save_path = os.path.join(ckpt_dir, "lora_weights.safetensors")
-        lora_network.save_weights(save_path, dtype=dtype)
-    else:
-        # Fallback SimpleLoRANetwork: extract only lora_down/lora_up params
-        state_dict = {}
-        for i, mod in enumerate(lora_network.lora_modules):
-            state_dict[f"lora_modules.{i}.lora_down.weight"] = mod.lora_down.weight.data.to(dtype)
-            state_dict[f"lora_modules.{i}.lora_up.weight"] = mod.lora_up.weight.data.to(dtype)
-        save_path = os.path.join(ckpt_dir, "lora_weights.safetensors")
-        safetensors_save_file(state_dict, save_path)
+    """Save LoRA weights as safetensors with architecture-aware key names.
+
+    Keys use the original model layer paths (e.g.
+    'transformer.layers.0.attention.to_q.lora_down.weight') so that ComfyUI
+    and other inference tools can map them back to the correct layers.
+    """
+    state_dict = {}
+    for i, mod in enumerate(lora_network.lora_modules):
+        layer_name = lora_network.module_layer_names[i]
+        state_dict[f"transformer.{layer_name}.lora_down.weight"] = mod.lora_down.weight.data.to(dtype)
+        state_dict[f"transformer.{layer_name}.lora_up.weight"] = mod.lora_up.weight.data.to(dtype)
+        state_dict[f"transformer.{layer_name}.alpha"] = torch.tensor(mod.scale * mod.lora_down.in_features)
+    save_path = os.path.join(ckpt_dir, "lora_weights.safetensors")
+    safetensors_save_file(state_dict, save_path)
 
 
 def check_control(control_file: str) -> str:
@@ -223,84 +225,60 @@ def load_and_preprocess_image(image_path: str, resolution: int) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# LoRA helpers — uses musubi-tuner style LoRA network
+# LoRA helpers
 # ---------------------------------------------------------------------------
+
+class LoRALinear(torch.nn.Module):
+    def __init__(self, orig: torch.nn.Linear, rank: int, alpha: float):
+        super().__init__()
+        self.orig = orig
+        orig_dtype = orig.weight.dtype
+        self.lora_down = torch.nn.Linear(orig.in_features, rank, bias=False, dtype=orig_dtype)
+        self.lora_up = torch.nn.Linear(rank, orig.out_features, bias=False, dtype=orig_dtype)
+        torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
+        torch.nn.init.zeros_(self.lora_up.weight)
+        self.scale = alpha / rank
+        self.multiplier = 1.0
+        # Freeze original weights
+        self.orig.requires_grad_(False)
+
+    def forward(self, x):
+        orig_out = self.orig(x)
+        if self.multiplier == 0.0:
+            return orig_out
+        lora_out = self.lora_up(self.lora_down(x)) * self.scale * self.multiplier
+        return orig_out + lora_out
+
+
+class SimpleLoRANetwork(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lora_modules = torch.nn.ModuleList()
+        self.module_layer_names = []  # original model layer path for each module
+        self.multiplier = 1.0
+
+    def set_multiplier(self, m):
+        self.multiplier = m
+        for mod in self.lora_modules:
+            mod.multiplier = m
+
+    def trainable_params(self):
+        params = []
+        for mod in self.lora_modules:
+            params.extend(mod.lora_down.parameters())
+            params.extend(mod.lora_up.parameters())
+        return params
+
 
 def create_lora_network(transformer, lora_rank: int, lora_alpha: float = None):
     """Create a LoRA network targeting ZImageTransformerBlock layers.
 
-    Returns the network and applies it to the transformer.
-    Uses the musubi-tuner LoRA implementation if available, otherwise falls
-    back to a simple manual approach.
+    Injects LoRA adapters into all Linear layers within ZImageTransformerBlock
+    modules (excluding modulation/refiner layers). Returns the network with
+    layer name tracking for correct weight serialization.
     """
     if lora_alpha is None:
         lora_alpha = float(lora_rank)
-
-    try:
-        # Try musubi-tuner LoRA (preferred — matches existing training infra)
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "musubi-tuner", "src"))
-        from musubi_tuner.networks import lora as mt_lora
-
-        network = mt_lora.create_network(
-            ZIMAGE_LORA_TARGET_MODULES,
-            "lora_unet",
-            1.0,  # multiplier
-            lora_rank,
-            lora_alpha,
-            None,   # vae
-            [],     # text_encoders
-            transformer,
-            exclude_patterns=ZIMAGE_LORA_EXCLUDE_PATTERNS,
-        )
-        network.apply_to([], transformer, apply_text_encoder=False, apply_unet=True)
-        print(f"[rlhf] Created musubi-tuner LoRA network (rank={lora_rank}, alpha={lora_alpha})")
-        print(f"[rlhf]   LoRA modules: {len(network.unet_loras)}")
-        return network
-
-    except ImportError:
-        print("[rlhf] musubi-tuner not found, falling back to manual LoRA creation")
-
-    # Fallback: manually inject LoRA into Linear layers of target modules
-    from collections import OrderedDict
-
-    class LoRALinear(torch.nn.Module):
-        def __init__(self, orig: torch.nn.Linear, rank: int, alpha: float):
-            super().__init__()
-            self.orig = orig
-            orig_dtype = orig.weight.dtype
-            self.lora_down = torch.nn.Linear(orig.in_features, rank, bias=False, dtype=orig_dtype)
-            self.lora_up = torch.nn.Linear(rank, orig.out_features, bias=False, dtype=orig_dtype)
-            torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
-            torch.nn.init.zeros_(self.lora_up.weight)
-            self.scale = alpha / rank
-            self.multiplier = 1.0
-            # Freeze original weights
-            self.orig.requires_grad_(False)
-
-        def forward(self, x):
-            orig_out = self.orig(x)
-            if self.multiplier == 0.0:
-                return orig_out
-            lora_out = self.lora_up(self.lora_down(x)) * self.scale * self.multiplier
-            return orig_out + lora_out
-
-    class SimpleLoRANetwork(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.lora_modules = torch.nn.ModuleList()
-            self.multiplier = 1.0
-
-        def set_multiplier(self, m):
-            self.multiplier = m
-            for mod in self.lora_modules:
-                mod.multiplier = m
-
-        def trainable_params(self):
-            params = []
-            for mod in self.lora_modules:
-                params.extend(mod.lora_down.parameters())
-                params.extend(mod.lora_up.parameters())
-            return params
 
     network = SimpleLoRANetwork()
 
@@ -336,8 +314,9 @@ def create_lora_network(transformer, lora_rank: int, lora_alpha: float = None):
         lora_linear = LoRALinear(module, lora_rank, lora_alpha)
         setattr(parent, child_attr, lora_linear)
         network.lora_modules.append(lora_linear)
+        network.module_layer_names.append(full_name)
 
-    print(f"[rlhf] Created fallback LoRA network (rank={lora_rank}, {len(network.lora_modules)} modules)")
+    print(f"[rlhf] Created LoRA network (rank={lora_rank}, alpha={lora_alpha}, {len(network.lora_modules)} modules)")
     return network
 
 
@@ -1231,11 +1210,7 @@ def main():
     lora_network.train()
 
     # Collect trainable LoRA parameters
-    if hasattr(lora_network, 'trainable_params'):
-        trainable_params = lora_network.trainable_params()
-    else:
-        # musubi-tuner LoRA network — parameters are on the network module
-        trainable_params = list(lora_network.parameters())
+    trainable_params = lora_network.trainable_params()
 
     # Re-enable gradients on LoRA params (they may have been frozen by
     # transformer.requires_grad_(False) since LoRA modules live inside the transformer)
@@ -1331,10 +1306,7 @@ def main():
             print(f"\n[rlhf] **** Stop signal received at step {step} ****")
             ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{step}")
             os.makedirs(ckpt_dir, exist_ok=True)
-            if hasattr(lora_network, 'save_weights'):
-                lora_network.save_weights(ckpt_dir, dtype=dtype)
-            else:
-                torch.save(lora_network.state_dict(), os.path.join(ckpt_dir, "lora_weights.safetensors"))
+            save_lora_weights(lora_network, ckpt_dir, dtype)
             print(f"[rlhf] Saved checkpoint at step {step} before stopping")
             write_status(args.status_file, step, args.max_train_steps, running_loss, "stopped")
             total_time = time.time() - train_start_time
@@ -1356,10 +1328,7 @@ def main():
                     print(f"[rlhf] **** Stop signal received while paused at step {step} ****")
                     ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{step}")
                     os.makedirs(ckpt_dir, exist_ok=True)
-                    if hasattr(lora_network, 'save_weights'):
-                        lora_network.save_weights(ckpt_dir, dtype=dtype)
-                    else:
-                        torch.save(lora_network.state_dict(), os.path.join(ckpt_dir, "lora_weights.safetensors"))
+                    save_lora_weights(lora_network, ckpt_dir, dtype)
                     print(f"[rlhf] Saved checkpoint at step {step} before stopping")
                     write_status(args.status_file, step, args.max_train_steps, running_loss, "stopped")
                     total_time = time.time() - train_start_time
