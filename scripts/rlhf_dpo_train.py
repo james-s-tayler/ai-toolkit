@@ -77,7 +77,6 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--max_train_steps", type=int, default=2000)
     parser.add_argument("--lora_rank", type=int, default=16)
-    parser.add_argument("--blocks_to_swap", type=int, default=16)
     parser.add_argument("--mixed_precision", type=str, default="bf16",
                         choices=["no", "fp16", "bf16"])
     parser.add_argument("--gradient_checkpointing", action="store_true")
@@ -86,7 +85,7 @@ def parse_args():
     parser.add_argument("--resolution", type=int, default=1024)
     parser.add_argument("--quantize", type=str, default="none",
                         choices=["none", "qfloat8"],
-                        help="Quantize base model weights (qfloat8 = FP8, auto-converts to torchao float8 when block swapping)")
+                        help="Quantize base model weights to FP8")
     parser.add_argument("--control_file", type=str, default="",
                         help="Path to control.json for pause/resume/stop signalling")
 
@@ -144,7 +143,7 @@ def save_lora_weights(lora_network, ckpt_dir: str, dtype):
         layer_name = lora_network.module_layer_names[i]
         state_dict[f"transformer.{layer_name}.lora_down.weight"] = mod.lora_down.weight.data.to(dtype)
         state_dict[f"transformer.{layer_name}.lora_up.weight"] = mod.lora_up.weight.data.to(dtype)
-        state_dict[f"transformer.{layer_name}.alpha"] = torch.tensor(mod.scale * mod.lora_down.in_features)
+        state_dict[f"transformer.{layer_name}.alpha"] = torch.tensor(float(mod.lora_down.out_features))
     save_path = os.path.join(ckpt_dir, "lora_weights.safetensors")
     safetensors_save_file(state_dict, save_path)
 
@@ -835,7 +834,6 @@ def main():
     print(f"[rlhf]   learning_rate     = {args.learning_rate:.2e}")
     print(f"[rlhf]   max_train_steps   = {args.max_train_steps}")
     print(f"[rlhf]   lora_rank         = {args.lora_rank}")
-    print(f"[rlhf]   blocks_to_swap    = {args.blocks_to_swap}")
     print(f"[rlhf]   save_every        = {args.save_every}")
     print(f"[rlhf]   status_every      = {args.status_every}")
     print(f"[rlhf]   resolution        = {args.resolution}")
@@ -1052,13 +1050,6 @@ def main():
         t0 = time.time()
         qtype_name = args.quantize  # "qfloat8"
 
-        # Auto-convert qfloat8 → float8 (torchao) when block swapping is active.
-        # quanto QTensors don't transfer cleanly between CPU/GPU.
-        # (Same pattern as config_modules.py)
-        if args.blocks_to_swap > 0 and qtype_name == "qfloat8":
-            qtype_name = "float8"
-            print(f"[rlhf] Quantization: auto-converted qfloat8 → float8 (torchao) for block swapping compatibility")
-
         # Add toolkit root to sys.path so we can import toolkit.util.quantize
         toolkit_root = os.path.join(os.path.dirname(__file__), "..")
         if toolkit_root not in sys.path:
@@ -1070,7 +1061,7 @@ def main():
         quantization_type = get_qtype(qtype_name)
         print(f"[rlhf] Quantizing transformer to {qtype_name}...")
 
-        # Quantize block-by-block: move each block to GPU → quantize → freeze → move back to CPU
+        # Quantize block-by-block: move each block to GPU → quantize → freeze → back to CPU
         # This avoids OOM from quantizing the entire model on GPU at once.
         block_attrs = ["layers", "noise_refiner", "context_refiner"]
         all_blocks = []
@@ -1087,9 +1078,6 @@ def main():
             block.to("cpu")
 
         # Quantize remaining non-block submodules (embedders, norms, etc.)
-        # These are small and stay on GPU permanently (block-swapping only
-        # offloads blocks). We leave them on GPU after quantizing because
-        # torchao AffineQuantizedTensor doesn't move with .to(device).
         print(f"[rlhf]   Quantizing remaining layers (embedders, norms)...")
         block_child_names = set()
         for attr in block_attrs:
@@ -1124,84 +1112,12 @@ def main():
     print("-" * 70)
 
     # -----------------------------------------------------------------------
-    # Move transformer to device (with optional block swapping for low VRAM)
+    # Move transformer to device
     # -----------------------------------------------------------------------
     t0 = time.time()
-    blocks_to_swap = args.blocks_to_swap
-    if blocks_to_swap > 0:
-        # Block swapping: keep N blocks on CPU, move to GPU on-the-fly during
-        # forward/backward.  The non-block parameters (patch embed, final norm,
-        # etc.) always stay on GPU since they are small.
-        print(f"[rlhf] Block swapping enabled: {blocks_to_swap} blocks on CPU")
-
-        # Identify the block lists.
-        # ZImageTransformer2DModel uses: layers, noise_refiner, context_refiner
-        block_attrs = ["layers", "noise_refiner", "context_refiner"]
-        all_blocks = []
-        for attr in block_attrs:
-            bl = getattr(transformer, attr, None)
-            if bl is not None:
-                all_blocks.extend(list(bl))
-
-        n_swap = min(blocks_to_swap, len(all_blocks))
-        gpu_blocks = all_blocks[: len(all_blocks) - n_swap]
-        cpu_blocks = all_blocks[len(all_blocks) - n_swap :]
-        print(f"[rlhf]   Total blocks: {len(all_blocks)}, on GPU: {len(gpu_blocks)}, on CPU: {len(cpu_blocks)}")
-
-        if args.quantize != "none":
-            # When quantized, non-block child modules are already on GPU from
-            # the quantization step and torchao tensors don't survive .to() moves.
-            # Move blocks to their designated devices, and ensure any top-level
-            # params/buffers (e.g. pad_token) not inside child modules are on GPU.
-            block_prefixes = tuple(a + "." for a in block_attrs)
-            for name, param in transformer.named_parameters():
-                if not name.startswith(block_prefixes):
-                    param.data = param.data.to(device)
-            for name, buf in transformer.named_buffers():
-                if not name.startswith(block_prefixes):
-                    buf.data = buf.data.to(device)
-            for block in cpu_blocks:
-                block.to("cpu")
-            for block in gpu_blocks:
-                block.to(device)
-        else:
-            # Start with everything on CPU, then selectively move to GPU
-            transformer = transformer.to("cpu")
-
-            # Move non-block params (embedders, norms, etc.) to GPU
-            block_prefixes = tuple(a + "." for a in block_attrs)
-            for name, param in transformer.named_parameters():
-                if not name.startswith(block_prefixes):
-                    param.data = param.data.to(device)
-            for name, buf in transformer.named_buffers():
-                if not name.startswith(block_prefixes):
-                    buf.data = buf.data.to(device)
-
-            # Move GPU-resident blocks
-            for block in gpu_blocks:
-                block.to(device)
-
-        # Register forward hooks to swap CPU blocks to/from GPU on demand
-        def _make_pre_hook(block_ref):
-            def hook(module, args):
-                block_ref.to(device)
-            return hook
-        def _make_post_hook(block_ref):
-            def hook(module, args, output):
-                block_ref.to("cpu")
-            return hook
-        for block in cpu_blocks:
-            block.register_forward_pre_hook(_make_pre_hook(block))
-            block.register_forward_hook(_make_post_hook(block))
-
-        # Don't call lora_network.to(device) here — LoRA weights live inside
-        # the transformer blocks and are already on the correct device.
-        # GPU blocks have their LoRA on GPU, CPU blocks have theirs on CPU.
-        # The forward hooks will swap CPU blocks (and their LoRA) on demand.
-    else:
-        print(f"[rlhf] Moving transformer to {device} (no block swapping)...")
-        transformer = transformer.to(device)
-        lora_network = lora_network.to(device)
+    print(f"[rlhf] Moving transformer to {device}...")
+    transformer = transformer.to(device)
+    lora_network = lora_network.to(device)
 
     print(f"[rlhf]   Transformer placement done in {time.time() - t0:.1f}s")
     log_vram("transformer on device")
@@ -1285,7 +1201,7 @@ def main():
                 print(f"[rlhf] WARNING: OOM during initial sample generation, skipping", file=sys.stderr)
                 torch.cuda.empty_cache()
             else:
-                print(f"[rlhf] WARNING: Initial sample generation failed: {e}", file=sys.stderr)
+                raise
     elif args.skip_first_sample and args.sample_every > 0 and sample_prompts_list:
         print(f"[rlhf] Skipping first sample (skip_first_sample=True)")
 
@@ -1482,7 +1398,7 @@ def main():
                     print(f"[rlhf] WARNING: OOM during sample generation, skipping", file=sys.stderr)
                     torch.cuda.empty_cache()
                 else:
-                    print(f"[rlhf] WARNING: Sample generation failed: {e}", file=sys.stderr)
+                    raise
 
         # VRAM logging every 100 steps
         if step % 100 == 0:
