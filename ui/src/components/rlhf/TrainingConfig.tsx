@@ -7,7 +7,6 @@ export interface TrainingParams {
   learning_rate: number;
   max_train_steps: number;
   lora_rank: number;
-  blocks_to_swap: number;
   save_every: number;
   mixed_precision: string;
   gradient_checkpointing: boolean;
@@ -27,7 +26,6 @@ export const DEFAULT_TRAINING_PARAMS: TrainingParams = {
   learning_rate: 1e-5,
   max_train_steps: 2000,
   lora_rank: 16,
-  blocks_to_swap: 16,
   save_every: 250,
   mixed_precision: 'bf16',
   gradient_checkpointing: true,
@@ -99,10 +97,6 @@ export default function TrainingConfig({ onStartTraining, initialConfig, evaluat
         <div>
           <label className={labelClass}>LoRA Rank</label>
           <input type="number" value={params.lora_rank} onChange={setParam('lora_rank')} disabled={disabled} className={fieldClass} />
-        </div>
-        <div>
-          <label className={labelClass}>Blocks to Swap (CPU)</label>
-          <input type="number" value={params.blocks_to_swap} onChange={setParam('blocks_to_swap')} min={0} disabled={disabled} className={fieldClass} />
         </div>
         <div>
           <label className={labelClass}>Save Checkpoint Every N Steps</label>
