@@ -60,7 +60,7 @@ export const Modal: React.FC<ModalProps> = ({
     <Fragment>
       {/* Modal backdrop */}
       <div
-        className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-gray-900 bg-opacity-75 backdrop-blur-sm transition-opacity"
+        className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-gray-900 bg-opacity-50 transition-opacity"
         onClick={handleOverlayClick}
         aria-modal="true"
         role="dialog"
@@ -68,14 +68,14 @@ export const Modal: React.FC<ModalProps> = ({
       >
         {/* Modal panel */}
         <div
-          className={`relative mx-auto w-full ${sizeClasses[size]} rounded-lg bg-gray-800 border border-gray-700 shadow-xl transition-all`}
+          className={`relative mx-auto w-full ${sizeClasses[size]} rounded-lg bg-white dark:bg-gray-900 border border-gray-700 shadow-xl transition-all`}
           onClick={e => e.stopPropagation()}
         >
           {/* Modal header */}
           {(title || showCloseButton) && (
             <div className="flex items-center justify-between rounded-t-lg border-b border-gray-700 bg-gray-850 px-6 py-4">
               {title && (
-                <h3 id="modal-title" className="text-xl font-semibold text-gray-100">
+                <h3 id="modal-title" className="text-xl font-semibold text-gray-100 min-w-0 truncate">
                   {title}
                 </h3>
               )}

@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef } from 'react';
 import Link from 'next/link';
 import { Button } from '@headlessui/react';
-import { FaRegTrashAlt, FaInfoCircle, FaFolderPlus } from 'react-icons/fa';
+import { FaRegTrashAlt, FaInfoCircle, FaFolderPlus, FaColumns } from 'react-icons/fa';
 import { openConfirm } from '@/components/ConfirmModal';
 import { TopBar, MainContent } from '@/components/layout';
 import UniversalTable, { TableColumn } from '@/components/UniversalTable';
@@ -11,6 +11,8 @@ import { apiClient } from '@/utils/api';
 import { Tooltip } from '@/components/Tooltip';
 import { formatDuration } from '@/utils/basic';
 import { Modal } from '@/components/Modal';
+import CompareSelectModal from '@/components/CompareSelectModal';
+import { useRouter } from 'next/navigation';
 
 interface GalleryFolder {
   id: number;
@@ -27,6 +29,36 @@ interface ImageStats {
   error?: boolean;
 }
 
+const GALLERY_STATS_CACHE_PREFIX = 'ai-toolkit-gallery-stats:';
+
+function getCachedGalleryStats(folderPath: string): ImageStats | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const cached = localStorage.getItem(GALLERY_STATS_CACHE_PREFIX + folderPath);
+    return cached ? (JSON.parse(cached) as ImageStats) : null;
+  } catch {
+    return null;
+  }
+}
+
+function setCachedGalleryStats(folderPath: string, stats: ImageStats): void {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.setItem(GALLERY_STATS_CACHE_PREFIX + folderPath, JSON.stringify(stats));
+  } catch {
+    // ignore storage quota errors
+  }
+}
+
+function removeCachedGalleryStats(folderPath: string): void {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.removeItem(GALLERY_STATS_CACHE_PREFIX + folderPath);
+  } catch {
+    // ignore errors
+  }
+}
+
 export default function GalleryPage() {
   const [folders, setFolders] = useState<GalleryFolder[]>([]);
   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
@@ -38,6 +70,8 @@ export default function GalleryPage() {
   const [addRecursive, setAddRecursive] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
   const [isAdding, setIsAdding] = useState(false);
+  const [isCompareModalOpen, setIsCompareModalOpen] = useState(false);
+  const router = useRouter();
 
   const refreshFolders = () => {
     setStatus('loading');
@@ -59,32 +93,64 @@ export default function GalleryPage() {
 
   useEffect(() => {
     const abortController = new AbortController();
+    const queue: string[] = [];
+    let active = 0;
+    const CONCURRENCY = 3;
+
+    function drain() {
+      if (abortController.signal.aborted) return;
+      while (active < CONCURRENCY && queue.length > 0) {
+        const folderPath = queue.shift();
+        if (!folderPath) break;
+        active++;
+
+        apiClient
+          .get(`/api/gallery/imageStats?folderPath=${encodeURIComponent(folderPath)}`, { signal: abortController.signal })
+          .then(res => res.data)
+          .then((data: ImageStats) => {
+            if (!abortController.signal.aborted) {
+              setCachedGalleryStats(folderPath, data);
+              setImageStats(prev => ({ ...prev, [folderPath]: data }));
+              setStatsLoading(prev => ({ ...prev, [folderPath]: false }));
+            }
+          })
+          .catch(error => {
+            if (!abortController.signal.aborted) {
+              console.error(`Error fetching stats for ${folderPath}:`, error);
+              // Only overwrite with error state if there is no cached value to fall back to
+              if (!getCachedGalleryStats(folderPath)) {
+                setImageStats(prev => ({
+                  ...prev,
+                  [folderPath]: { totalCount: 0, imageCount: 0, videoCount: 0, totalVideoDuration: 0, resolutionBreakdown: {}, error: true },
+                }));
+              }
+              setStatsLoading(prev => ({ ...prev, [folderPath]: false }));
+            }
+          })
+          .finally(() => {
+            active--;
+            drain();
+          });
+      }
+    }
+
     if (folders.length > 0) {
       folders.forEach(folder => {
         if (!requestedFolders.current.has(folder.path)) {
           requestedFolders.current.add(folder.path);
-          setStatsLoading(prev => ({ ...prev, [folder.path]: true }));
-          apiClient
-            .get(`/api/gallery/imageStats?folderPath=${encodeURIComponent(folder.path)}`, { signal: abortController.signal })
-            .then(res => res.data)
-            .then((data: ImageStats) => {
-              if (!abortController.signal.aborted) {
-                setImageStats(prev => ({ ...prev, [folder.path]: data }));
-                setStatsLoading(prev => ({ ...prev, [folder.path]: false }));
-              }
-            })
-            .catch(error => {
-              if (!abortController.signal.aborted) {
-                console.error(`Error fetching stats for ${folder.path}:`, error);
-                setImageStats(prev => ({
-                  ...prev,
-                  [folder.path]: { totalCount: 0, imageCount: 0, videoCount: 0, totalVideoDuration: 0, resolutionBreakdown: {}, error: true },
-                }));
-                setStatsLoading(prev => ({ ...prev, [folder.path]: false }));
-              }
-            });
+
+          // Show cached stats immediately so the page is usable right away
+          const cached = getCachedGalleryStats(folder.path);
+          if (cached) {
+            setImageStats(prev => ({ ...prev, [folder.path]: cached }));
+          } else {
+            setStatsLoading(prev => ({ ...prev, [folder.path]: true }));
+          }
+
+          queue.push(folder.path);
         }
       });
+      drain();
     }
     return () => {
       abortController.abort();
@@ -101,6 +167,8 @@ export default function GalleryPage() {
         apiClient
           .post('/api/gallery/remove', { id: folder.id })
           .then(() => {
+            // Clear stats from state and cache
+            removeCachedGalleryStats(folder.path);
             setImageStats(prev => {
               const next = { ...prev };
               delete next[folder.path];
@@ -228,7 +296,16 @@ export default function GalleryPage() {
           <h1 className="text-2xl font-semibold text-gray-100">Gallery</h1>
         </div>
         <div className="flex-1" />
-        <div>
+        <div className="flex gap-2">
+          {folders.length >= 2 && (
+            <Button
+              className="text-gray-200 bg-slate-600 px-4 py-2 rounded-md hover:bg-slate-500 transition-colors flex items-center gap-2"
+              onClick={() => setIsCompareModalOpen(true)}
+            >
+              <FaColumns />
+              Compare Folders
+            </Button>
+          )}
           <Button
             className="text-gray-200 bg-slate-600 px-4 py-2 rounded-md hover:bg-slate-500 transition-colors flex items-center gap-2"
             onClick={() => { setAddError(null); setIsAddModalOpen(true); }}
@@ -298,6 +375,23 @@ export default function GalleryPage() {
           </form>
         </div>
       </Modal>
+
+      <CompareSelectModal
+        isOpen={isCompareModalOpen}
+        onClose={() => setIsCompareModalOpen(false)}
+        mode="gallery"
+        items={folders.map(f => ({ label: f.path, value: f.path }))}
+        onCompare={(left, right, center) => {
+          const leftFolder = folders.find(f => f.path === left);
+          const rightFolder = folders.find(f => f.path === right);
+          const centerFolder = center ? folders.find(f => f.path === center) : null;
+          if (leftFolder && rightFolder) {
+            let url = `/gallery/compare?left=${leftFolder.id}&right=${rightFolder.id}`;
+            if (centerFolder) url += `&center=${centerFolder.id}`;
+            router.push(url);
+          }
+        }}
+      />
     </>
   );
 }

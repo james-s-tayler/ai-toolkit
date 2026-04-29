@@ -22,6 +22,7 @@ from toolkit.util.quantize import quantize, get_qtype, quantize_model
 from toolkit.memory_management import MemoryManager
 from safetensors.torch import load_file
 from PIL import Image
+import huggingface_hub
 
 try:
     from diffusers import LTX2Pipeline, LTX2ImageToVideoPipeline
@@ -35,7 +36,7 @@ try:
         Gemma3ForConditionalGeneration,
         GemmaTokenizerFast,
     )
-    from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
+    from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder, LTX2VocoderWithBWE
     from diffusers.pipelines.ltx2.connectors import LTX2TextConnectors
     from .convert_ltx2_to_diffusers import (
         get_model_state_dict_from_combined_ckpt,
@@ -77,6 +78,9 @@ dit_prefix = "model.diffusion_model."
 vae_prefix = "vae."
 audio_vae_prefix = "audio_vae."
 vocoder_prefix = "vocoder."
+base_te_path = "Lightricks/gemma-3-12b-it-qat-q4_0-unquantized"
+
+HF_TOKEN = os.getenv("HF_TOKEN", None)
 
 
 def new_save_image_function(
@@ -118,6 +122,10 @@ class ComboVae(torch.nn.Module):
     @property
     def dtype(self):
         return self.vae.dtype
+
+    @property
+    def config(self):
+        return self.vae.config
 
     def encode(
         self,
@@ -193,6 +201,8 @@ class AudioProcessor(torch.nn.Module):
 
 class LTX2Model(BaseModel):
     arch = "ltx2"
+    ltx_version = "2.0"
+    ltx_te_path = None
 
     def __init__(
         self,
@@ -206,6 +216,8 @@ class LTX2Model(BaseModel):
         super().__init__(
             device, model_config, dtype, custom_pipeline, noise_scheduler, **kwargs
         )
+        # always-on detailed logging for LTX2 — overrides the model_config flag
+        self.model_config.verbose = True
         self.is_flow_matching = True
         self.is_transformer = True
         self.target_lora_modules = ["LTX2VideoTransformer3DModel"]
@@ -214,9 +226,12 @@ class LTX2Model(BaseModel):
         # use the new format on this new model by default
         self.use_old_lokr_format = False
         self.audio_processor = None
-        
+
         # gemma needs left side padding
         self.te_padding_side = "left"
+
+        # invalidate older caches
+        self.latent_space_version = f"{self.arch}_v2"
 
     # static method to get the noise scheduler
     @staticmethod
@@ -229,30 +244,53 @@ class LTX2Model(BaseModel):
     def load_model(self):
         dtype = self.torch_dtype
         verbose = self.model_config.verbose
-        print_verbose(verbose, f"load_model() called with dtype={dtype}")
+        print_verbose(verbose, f"load_model() called with dtype={dtype}, ltx_version={self.ltx_version}")
         self.print_and_status_update("Loading LTX2 model")
         model_path = self.model_config.name_or_path
         base_model_path = self.model_config.extras_name_or_path
-        print_verbose(verbose, f"Model paths: model_path={model_path}, base_model_path={base_model_path}")
+        print_verbose(verbose, f"Model paths: model_path={model_path}, base_model_path={base_model_path}, te_name_or_path={self.model_config.te_name_or_path}, ltx_te_path={self.ltx_te_path}")
 
         combined_state_dict = None
 
         self.print_and_status_update("Loading transformer")
+
+        if not os.path.exists(model_path) and model_path.endswith(".safetensors"):
+            # download the model from the Hugging Face Hub if it is not a local path
+            print_verbose(verbose, f"model_path is a remote .safetensors target (does not exist locally), preparing HuggingFace Hub download: {model_path}")
+            splits = model_path.split("/")
+            if len(splits) != 3:
+                raise ValueError(
+                    f"Invalid model path: {model_path}. Must be in the format 'repo_id/repo/filename.safetensors' to download from the Hugging Face Hub."
+                )
+            # download the model from the hub
+            print_verbose(verbose, f"Calling huggingface_hub.hf_hub_download(repo_id={'/'.join(splits[:2])}, filename={splits[2]}, token={'<set>' if HF_TOKEN else '<unset>'})")
+            model_path = huggingface_hub.hf_hub_download(
+                repo_id="/".join(splits[:2]),
+                filename=splits[2],
+                token=HF_TOKEN,
+            )
+            print_verbose(verbose, f"hf_hub_download returned local path: {model_path}")
+
         # if we have a safetensors file it is a mono checkpoint
         if os.path.exists(model_path) and model_path.endswith(".safetensors"):
             print_verbose(verbose, f"Loading combined state dict from safetensors file: {model_path}")
             combined_state_dict = load_file(model_path)
+            print_verbose(verbose, f"Combined state dict loaded, keys before dequantize: {len(combined_state_dict)}")
             combined_state_dict = dequantize_state_dict(combined_state_dict)
-            print_verbose(verbose, f"Combined state dict loaded and dequantized, keys: {len(combined_state_dict)}")
+            print_verbose(verbose, f"Combined state dict dequantized, keys: {len(combined_state_dict)}")
 
         if combined_state_dict is not None:
-            print_verbose(verbose, f"Converting transformer from combined checkpoint")
+            print_verbose(verbose, f"Converting transformer from combined checkpoint (version={self.ltx_version})")
             original_dit_ckpt = get_model_state_dict_from_combined_ckpt(
                 combined_state_dict, dit_prefix
             )
-            transformer = convert_ltx2_transformer(original_dit_ckpt)
+            print_verbose(verbose, f"Extracted DiT state dict, keys: {len(original_dit_ckpt)}")
+            transformer = convert_ltx2_transformer(
+                original_dit_ckpt, version=self.ltx_version
+            )
+            print_verbose(verbose, f"Transformer converted, casting to dtype={dtype}")
             transformer = transformer.to(dtype)
-            print_verbose(verbose, f"Transformer converted and moved to dtype={dtype}")
+            print_verbose(verbose, f"Transformer moved to dtype={dtype}")
         else:
             transformer_path = model_path
             transformer_subfolder = "transformer"
@@ -266,18 +304,18 @@ class LTX2Model(BaseModel):
                     base_model_path = model_path
                     print_verbose(verbose, f"Found full checkpoint, using as base_model_path: {base_model_path}")
 
-            print_verbose(verbose, f"Loading transformer from pretrained: path={transformer_path}, subfolder={transformer_subfolder}")
+            print_verbose(verbose, f"Loading transformer from pretrained: path={transformer_path}, subfolder={transformer_subfolder}, dtype={dtype}")
             transformer = LTX2VideoTransformer3DModel.from_pretrained(
                 transformer_path, subfolder=transformer_subfolder, torch_dtype=dtype
             )
-            print_verbose(verbose, f"Transformer loaded from pretrained")
+            print_verbose(verbose, f"Transformer loaded from pretrained, on device={transformer.device}")
 
         if self.model_config.quantize:
             self.print_and_status_update("Quantizing Transformer")
             print_verbose(verbose, f"Quantizing transformer model")
             quantize_model(self, transformer)
             flush()
-            print_verbose(verbose, f"Transformer quantization complete")
+            print_verbose(verbose, f"Transformer quantization complete and flushed")
 
         if (
             self.model_config.layer_offloading
@@ -292,7 +330,7 @@ class LTX2Model(BaseModel):
                 ignore_modules.append(block.audio_a2v_cross_attn_scale_shift_table)
             ignore_modules.append(transformer.scale_shift_table)
             ignore_modules.append(transformer.audio_scale_shift_table)
-            print_verbose(verbose, f"Attaching MemoryManager to transformer with {len(ignore_modules)} ignored modules")
+            print_verbose(verbose, f"Attaching MemoryManager to transformer with {len(ignore_modules)} ignored modules — this can take a while for large transformers")
             MemoryManager.attach(
                 transformer,
                 self.device_torch,
@@ -318,11 +356,10 @@ class LTX2Model(BaseModel):
             and self.model_config.te_name_or_path.endswith(".safetensors")
         ):
             # load from comfyui gemma3 checkpoint
-            print_verbose(verbose, f"Loading text encoder from ComfyUI checkpoint: {self.model_config.te_name_or_path}")
-            tokenizer = GemmaTokenizerFast.from_pretrained(
-                "Lightricks/LTX-2", subfolder="tokenizer"
-            )
-            print_verbose(verbose, f"Tokenizer loaded from Lightricks/LTX-2")
+            print_verbose(verbose, f"Loading text encoder from ComfyUI safetensors checkpoint: {self.model_config.te_name_or_path}")
+            print_verbose(verbose, f"Loading tokenizer from {base_te_path}")
+            tokenizer = GemmaTokenizerFast.from_pretrained(base_te_path)
+            print_verbose(verbose, f"Tokenizer loaded from {base_te_path}")
 
             with init_empty_weights():
                 text_encoder = Gemma3ForConditionalGeneration(
@@ -385,39 +422,65 @@ class LTX2Model(BaseModel):
                         }
                     )
                 )
-            print_verbose(verbose, f"Text encoder initialized with empty weights (Gemma3Config)")
+            print_verbose(verbose, f"Text encoder initialized with empty weights (Gemma3Config), loading state dict from {self.model_config.te_name_or_path}")
             te_state_dict = load_file(self.model_config.te_name_or_path)
-            print_verbose(verbose, f"Text encoder state dict loaded from {self.model_config.te_name_or_path}, keys: {len(te_state_dict)}")
+            print_verbose(verbose, f"Text encoder state dict loaded, keys: {len(te_state_dict)}, converting from ComfyUI format")
             te_state_dict = convert_comfy_gemma3_to_transformers(te_state_dict)
-            print_verbose(verbose, f"Text encoder state dict converted from ComfyUI to Transformers format")
+            print_verbose(verbose, f"Text encoder state dict converted, casting tensors to dtype={dtype}")
             for key in te_state_dict:
                 te_state_dict[key] = te_state_dict[key].to(dtype)
 
+            print_verbose(verbose, f"Loading state dict into text encoder (assign=True, strict=True)")
             text_encoder.load_state_dict(te_state_dict, assign=True, strict=True)
-            print_verbose(verbose, f"Text encoder state dict loaded (assign=True, strict=True)")
+            print_verbose(verbose, f"Text encoder state dict loaded, deleting and flushing")
             del te_state_dict
             flush()
             print_verbose(verbose, f"Deleted state dict and flushed GPU cache")
-        else:
-            if self.model_config.te_name_or_path is not None:
-                te_path = self.model_config.te_name_or_path
-            else:
-                te_path = base_model_path
-            print_verbose(verbose, f"Loading text encoder from pretrained path: {te_path}")
+        elif self.model_config.te_name_or_path is not None:
+            # a repo or folder
+            print_verbose(verbose, f"Loading text encoder from repo/folder: {self.model_config.te_name_or_path}")
             tokenizer = GemmaTokenizerFast.from_pretrained(
-                te_path, subfolder="tokenizer"
+                self.model_config.te_name_or_path
             )
-            print_verbose(verbose, f"Tokenizer loaded from {te_path}/tokenizer")
+            print_verbose(verbose, f"Tokenizer loaded, now loading text encoder weights with dtype={dtype}")
             text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
-                te_path, subfolder="text_encoder", dtype=dtype
+                self.model_config.te_name_or_path, dtype=dtype
             )
-            print_verbose(verbose, f"Text encoder loaded from {te_path}/text_encoder with dtype={dtype}")
+            print_verbose(verbose, f"Text encoder loaded from {self.model_config.te_name_or_path}")
+        elif self.ltx_te_path is not None:
+            # pull from model specific te
+            print_verbose(verbose, f"Loading text encoder from ltx_te_path: {self.ltx_te_path}")
+            tokenizer = GemmaTokenizerFast.from_pretrained(self.ltx_te_path)
+            print_verbose(verbose, f"Tokenizer loaded, now loading text encoder weights with dtype={dtype}")
+            text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
+                self.ltx_te_path, dtype=dtype
+            )
+            print_verbose(verbose, f"Text encoder loaded from {self.ltx_te_path}")
+        else:
+            # using combo hf repo
+            print_verbose(verbose, f"Loading text encoder from combo HF repo: {self.model_config.name_or_path} (subfolder=tokenizer/text_encoder)")
+            tokenizer = GemmaTokenizerFast.from_pretrained(
+                self.model_config.name_or_path, subfolder="tokenizer"
+            )
+            print_verbose(verbose, f"Tokenizer loaded, now loading text encoder weights with dtype={dtype}")
+            text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
+                self.model_config.name_or_path, subfolder="text_encoder", dtype=dtype
+            )
+            print_verbose(verbose, f"Text encoder loaded from {self.model_config.name_or_path}/text_encoder")
 
         # remove the vision tower
         text_encoder.model.vision_tower = None
         print_verbose(verbose, f"Vision tower removed from text encoder")
         flush()
         print_verbose(verbose, f"Flushed GPU cache after text encoder loading")
+
+        if self.model_config.quantize_te:
+            self.print_and_status_update("Quantizing Text Encoder")
+            print_verbose(verbose, f"Quantizing text encoder with qtype={self.model_config.qtype_te}")
+            quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
+            freeze(text_encoder)
+            flush()
+            print_verbose(verbose, f"Text encoder quantized and frozen")
 
         if (
             self.model_config.layer_offloading
@@ -441,40 +504,44 @@ class LTX2Model(BaseModel):
         flush()
         print_verbose(verbose, f"Flushed GPU cache")
 
-        if self.model_config.quantize_te:
-            self.print_and_status_update("Quantizing Text Encoder")
-            print_verbose(verbose, f"Quantizing text encoder with qtype={self.model_config.qtype_te}")
-            quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
-            freeze(text_encoder)
-            flush()
-            print_verbose(verbose, f"Text encoder quantized and frozen")
-
         self.print_and_status_update("Loading VAEs and other components")
         print_verbose(verbose, f"Starting VAE and component loading")
         if combined_state_dict is not None:
-            print_verbose(verbose, f"Converting VAEs and components from combined checkpoint")
+            print_verbose(verbose, f"Converting VAEs and components from combined checkpoint (version={self.ltx_version})")
             original_vae_ckpt = get_model_state_dict_from_combined_ckpt(
                 combined_state_dict, vae_prefix
             )
-            vae = convert_ltx2_video_vae(original_vae_ckpt).to(dtype)
+            print_verbose(verbose, f"Converting video VAE")
+            vae = convert_ltx2_video_vae(
+                original_vae_ckpt, version=self.ltx_version
+            ).to(dtype)
             print_verbose(verbose, f"Video VAE converted and moved to dtype={dtype}")
             del original_vae_ckpt
             original_audio_vae_ckpt = get_model_state_dict_from_combined_ckpt(
                 combined_state_dict, audio_vae_prefix
             )
-            audio_vae = convert_ltx2_audio_vae(original_audio_vae_ckpt).to(dtype)
+            print_verbose(verbose, f"Converting audio VAE")
+            audio_vae = convert_ltx2_audio_vae(
+                original_audio_vae_ckpt, version=self.ltx_version
+            ).to(dtype)
             print_verbose(verbose, f"Audio VAE converted and moved to dtype={dtype}")
             del original_audio_vae_ckpt
             original_connectors_ckpt = get_model_state_dict_from_combined_ckpt(
                 combined_state_dict, dit_prefix
             )
-            connectors = convert_ltx2_connectors(original_connectors_ckpt).to(dtype)
+            print_verbose(verbose, f"Converting connectors")
+            connectors = convert_ltx2_connectors(
+                original_connectors_ckpt, version=self.ltx_version
+            ).to(dtype)
             print_verbose(verbose, f"Connectors converted and moved to dtype={dtype}")
             del original_connectors_ckpt
             original_vocoder_ckpt = get_model_state_dict_from_combined_ckpt(
                 combined_state_dict, vocoder_prefix
             )
-            vocoder = convert_ltx2_vocoder(original_vocoder_ckpt).to(dtype)
+            print_verbose(verbose, f"Converting vocoder")
+            vocoder = convert_ltx2_vocoder(
+                original_vocoder_ckpt, version=self.ltx_version
+            ).to(dtype)
             print_verbose(verbose, f"Vocoder converted and moved to dtype={dtype}")
             del original_vocoder_ckpt
             del combined_state_dict
@@ -482,24 +549,32 @@ class LTX2Model(BaseModel):
             print_verbose(verbose, f"Deleted checkpoints and flushed GPU cache")
         else:
             print_verbose(verbose, f"Loading VAEs and components from pretrained: {base_model_path}")
+            print_verbose(verbose, f"Loading video VAE from {base_model_path}/vae")
             vae = AutoencoderKLLTX2Video.from_pretrained(
                 base_model_path, subfolder="vae", torch_dtype=dtype
             )
-            print_verbose(verbose, f"Video VAE loaded from {base_model_path}/vae")
+            print_verbose(verbose, f"Video VAE loaded")
+            print_verbose(verbose, f"Loading audio VAE from {base_model_path}/audio_vae")
             audio_vae = AutoencoderKLLTX2Audio.from_pretrained(
                 base_model_path, subfolder="audio_vae", torch_dtype=dtype
             )
-            print_verbose(verbose, f"Audio VAE loaded from {base_model_path}/audio_vae")
+            print_verbose(verbose, f"Audio VAE loaded")
 
+            print_verbose(verbose, f"Loading connectors from {base_model_path}/connectors")
             connectors = LTX2TextConnectors.from_pretrained(
                 base_model_path, subfolder="connectors", torch_dtype=dtype
             )
-            print_verbose(verbose, f"Connectors loaded from {base_model_path}/connectors")
+            print_verbose(verbose, f"Connectors loaded")
 
-            vocoder = LTX2Vocoder.from_pretrained(
+            vocoder_cls = LTX2Vocoder
+            if self.ltx_version == "2.3":
+                vocoder_cls = LTX2VocoderWithBWE
+            print_verbose(verbose, f"Loading vocoder ({vocoder_cls.__name__}) from {base_model_path}/vocoder")
+
+            vocoder = vocoder_cls.from_pretrained(
                 base_model_path, subfolder="vocoder", torch_dtype=dtype
             )
-            print_verbose(verbose, f"Vocoder loaded from {base_model_path}/vocoder")
+            print_verbose(verbose, f"Vocoder loaded")
 
         self.noise_scheduler = LTX2Model.get_train_scheduler()
         print_verbose(verbose, f"Noise scheduler created")
@@ -579,6 +654,14 @@ class LTX2Model(BaseModel):
         self.pipeline.vae.eval()
         self.pipeline.vae.requires_grad_(False)
 
+        if self.model_config.low_vram:
+            print_verbose(verbose, f"low_vram: enabling framewise encoding/decoding on VAE")
+            self.pipeline.vae.tile_sample_min_num_frames = 64
+            self.pipeline.vae.tile_sample_stride_num_frames = 16
+            # they check the wrong flat on encode currently so set both to future proof
+            self.pipeline.vae.use_framewise_decoding = True
+            self.pipeline.vae.use_framewise_encoding = True
+
         image_list = [image.to(device, dtype=dtype) for image in image_list]
         print_verbose(verbose, f"Images moved to device={device}, dtype={dtype}")
 
@@ -588,20 +671,21 @@ class LTX2Model(BaseModel):
             if image.ndim == 3:
                 # (C, H, W) -> (C, 1, H, W)
                 norm_images.append(image.unsqueeze(1))
-                print_verbose(verbose, f"Image {i}: shape {image.shape} -> {norm_images[-1].shape} (added time dim)")
+                print_verbose(verbose, f"Image {i}: shape {tuple(image.shape)} -> {tuple(norm_images[-1].shape)} (added time dim)")
             elif image.ndim == 4:
                 # (T, C, H, W) -> (C, T, H, W)
                 norm_images.append(image.permute(1, 0, 2, 3))
-                print_verbose(verbose, f"Image {i}: shape {image.shape} -> {norm_images[-1].shape} (permuted dims)")
+                print_verbose(verbose, f"Image {i}: shape {tuple(image.shape)} -> {tuple(norm_images[-1].shape)} (permuted dims)")
             else:
                 raise ValueError(f"Invalid image shape: {image.shape}")
 
         # Stack to (B, C, T, H, W)
         images = torch.stack(norm_images)
-        print_verbose(verbose, f"Stacked images shape: {images.shape}")
+        print_verbose(verbose, f"Stacked images shape: {tuple(images.shape)}")
 
-        latents = self.pipeline.vae.encode(images).latent_dist.mode()
-        print_verbose(verbose, f"VAE encoded, latents shape: {latents.shape}")
+        print_verbose(verbose, f"Running VAE encode")
+        latents = self.pipeline.vae.encode(images).latent_dist.sample()
+        print_verbose(verbose, f"VAE encoded, latents shape: {tuple(latents.shape)}")
 
         # Normalize latents across the channel dimension [B, C, F, H, W]
         scaling_factor = 1.0
@@ -614,7 +698,12 @@ class LTX2Model(BaseModel):
         latents = (latents - latents_mean) * scaling_factor / latents_std
         print_verbose(verbose, f"Latents normalized with scaling_factor={scaling_factor}")
 
-        print_verbose(verbose, f"encode_images() completed, returning latents shape: {latents.shape}")
+        if self.model_config.low_vram:
+            self.pipeline.vae.use_framewise_decoding = False
+            self.pipeline.vae.use_framewise_encoding = False
+            print_verbose(verbose, f"low_vram: restored framewise flags to False")
+
+        print_verbose(verbose, f"encode_images() completed, returning latents shape: {tuple(latents.shape)}")
         return latents.to(device, dtype=dtype)
 
     def get_generation_pipeline(self):
@@ -647,14 +736,14 @@ class LTX2Model(BaseModel):
         extra: dict,
     ):
         verbose = self.model_config.verbose
-        print_verbose(verbose, f"generate_single_image() called: num_frames={gen_config.num_frames}, height={gen_config.height}, width={gen_config.width}")
+        print_verbose(verbose, f"generate_single_image() called: num_frames={gen_config.num_frames}, height={gen_config.height}, width={gen_config.width}, ctrl_img={gen_config.ctrl_img}")
         if self.model.device == torch.device("cpu"):
             print_verbose(verbose, f"Moving transformer from CPU to {self.device_torch}")
             self.model.to(self.device_torch)
 
         # handle control image
         if gen_config.ctrl_img is not None:
-            print_verbose(verbose, f"Control image provided: {gen_config.ctrl_img}, switching to Image-to-Video pipeline")
+            print_verbose(verbose, f"Control image provided: {gen_config.ctrl_img}, switching to LTX2ImageToVideoPipeline")
             # switch to image to video pipeline
             pipeline = LTX2ImageToVideoPipeline(
                 scheduler=pipeline.scheduler,
@@ -681,6 +770,7 @@ class LTX2Model(BaseModel):
 
         # reactivate progress bar since this is slooooow
         pipeline.set_progress_bar_config(disable=False)
+        print_verbose(verbose, f"Moving generation pipeline to {self.device_torch}")
         pipeline = pipeline.to(self.device_torch)
         print_verbose(verbose, f"Pipeline moved to {self.device_torch}, progress bar enabled")
 
@@ -713,22 +803,38 @@ class LTX2Model(BaseModel):
                 print_verbose(verbose, f"Adjusted num_frames for divisibility: {original_num_frames} -> {gen_config.num_frames}")
 
         if self.low_vram:
-            print_verbose(verbose, f"Low VRAM mode: enabling VAE tiling")
+            print_verbose(verbose, f"low_vram: enabling framewise decoding on VAE")
             # set vae to tile decode
-            pipeline.vae.enable_tiling(
-                tile_sample_min_height=256,
-                tile_sample_min_width=256,
-                tile_sample_min_num_frames=8,
-                tile_sample_stride_height=224,
-                tile_sample_stride_width=224,
-                tile_sample_stride_num_frames=4,
-            )
-            print_verbose(verbose, f"VAE tiling enabled")
-        
+            # pipeline.vae.enable_tiling(
+            #     tile_sample_min_height=256,
+            #     tile_sample_min_width=256,
+            #     tile_sample_min_num_frames=8,
+            #     tile_sample_stride_height=224,
+            #     tile_sample_stride_width=224,
+            #     tile_sample_stride_num_frames=4,
+            # )
+            self.pipeline.vae.tile_sample_min_num_frames = 16
+            self.pipeline.vae.tile_sample_stride_num_frames = 8
+            self.pipeline.vae.use_framewise_decoding = True
+
         # We only encode and store the minimum prompt tokens, but need them padded to 1024 for LTX2
         conditional_embeds = self.pad_embeds(conditional_embeds)
         unconditional_embeds = self.pad_embeds(unconditional_embeds)
         print_verbose(verbose, f"Embeddings padded to 1024 tokens")
+
+        if self.ltx_version == "2.3":
+            print_verbose(verbose, f"LTX 2.3: applying 2.3-specific generation extras")
+            extra["stg_scale"] = 1.0
+            extra["modality_scale"] = 3.0
+            extra["guidance_rescale"] = 0.7
+            extra["audio_guidance_scale"] = 7.0
+            extra["audio_stg_scale"] = 1.0
+            extra["audio_modality_scale"] = 3.0
+            extra["audio_guidance_rescale"] = 0.7
+            extra["spatio_temporal_guidance_blocks"] = [28]
+            extra["use_cross_timestep"] = (
+                True  # they dont set this in some examples in diffusers, but I believe it should always be true for 2.3
+            )
 
         print_verbose(verbose, f"Running pipeline inference: num_inference_steps={gen_config.num_inference_steps}, guidance_scale={gen_config.guidance_scale}")
         video, audio = pipeline(
@@ -758,14 +864,15 @@ class LTX2Model(BaseModel):
         print_verbose(verbose, f"Pipeline inference completed")
         if self.low_vram:
             # Restore no tiling
-            pipeline.vae.use_tiling = False
-            print_verbose(verbose, f"VAE tiling disabled")
+            # pipeline.vae.use_tiling = False
+            self.pipeline.vae.use_framewise_decoding = False
+            print_verbose(verbose, f"low_vram: restored framewise_decoding=False")
 
         if is_video:
-            # return as a dict, we will handle it with an override function
+            # redurn as a dict, we will handle it with an override function
             video = (video * 255).round().astype("uint8")
             video = torch.from_numpy(video)
-            print_verbose(verbose, f"Video mode: converted output, video shape={video[0].shape}, audio shape={audio[0].shape}")
+            print_verbose(verbose, f"Video mode: converted output, video shape={tuple(video[0].shape)}, audio shape={tuple(audio[0].shape)}")
             print_verbose(verbose, f"generate_single_image() completed, returning video dict")
             return {
                 "video": video[0],
@@ -807,30 +914,30 @@ class LTX2Model(BaseModel):
                 device=self.device_torch, dtype=torch.float32
             )
             sample_rate = audio_data["sample_rate"]
-            print_verbose(verbose, f"Audio {idx}: sample_rate={sample_rate}, waveform shape={waveform.shape}")
+            print_verbose(verbose, f"Audio {idx}: sample_rate={sample_rate}, waveform shape={tuple(waveform.shape)}")
 
             # Add batch dimension if needed: [channels, samples] -> [batch, channels, samples]
             if waveform.dim() == 2:
                 waveform = waveform.unsqueeze(0)
-                print_verbose(verbose, f"Audio {idx}: Added batch dimension, new shape={waveform.shape}")
+                print_verbose(verbose, f"Audio {idx}: Added batch dimension, new shape={tuple(waveform.shape)}")
 
             if waveform.shape[1] == 1:
                 # make sure it is stereo
                 waveform = waveform.repeat(1, 2, 1)
-                print_verbose(verbose, f"Audio {idx}: Converted mono to stereo, new shape={waveform.shape}")
+                print_verbose(verbose, f"Audio {idx}: Converted mono to stereo, new shape={tuple(waveform.shape)}")
 
             # Convert waveform to mel spectrogram using AudioProcessor
             mel_spectrogram = self.audio_processor.waveform_to_mel(
                 waveform, waveform_sample_rate=sample_rate
             )
             mel_spectrogram = mel_spectrogram.to(dtype=self.torch_dtype)
-            print_verbose(verbose, f"Audio {idx}: Converted to mel spectrogram, shape={mel_spectrogram.shape}")
+            print_verbose(verbose, f"Audio {idx}: Converted to mel spectrogram, shape={tuple(mel_spectrogram.shape)}")
 
             # Encode mel spectrogram to latents
             latents = self.pipeline.audio_vae.encode(
                 mel_spectrogram.to(self.device_torch, dtype=self.torch_dtype)
-            ).latent_dist.mode()
-            print_verbose(verbose, f"Audio {idx}: Audio VAE encoded, latents shape={latents.shape}")
+            ).latent_dist.sample()
+            print_verbose(verbose, f"Audio {idx}: Audio VAE encoded, latents shape={tuple(latents.shape)}")
 
             if audio_num_frames is None:
                 audio_num_frames = latents.shape[2]  # (latents is [B, C, T, F])
@@ -841,7 +948,7 @@ class LTX2Model(BaseModel):
                 # patch_size=self.pipeline.transformer.config.audio_patch_size,
                 # patch_size_t=self.pipeline.transformer.config.audio_patch_size_t,
             )  # [B, L, C * M]
-            print_verbose(verbose, f"Audio {idx}: Packed latents shape={packed_latents.shape}")
+            print_verbose(verbose, f"Audio {idx}: Packed latents shape={tuple(packed_latents.shape)}")
             if output_tensor is None:
                 output_tensor = packed_latents
             else:
@@ -851,10 +958,10 @@ class LTX2Model(BaseModel):
         latents_mean = self.pipeline.audio_vae.latents_mean
         latents_std = self.pipeline.audio_vae.latents_std
         output_tensor = (output_tensor - latents_mean) / latents_std
-        print_verbose(verbose, f"Audio latents normalized, final output shape={output_tensor.shape}")
+        print_verbose(verbose, f"Audio latents normalized, final output shape={tuple(output_tensor.shape)}")
         print_verbose(verbose, f"encode_audio() completed")
         return output_tensor
-    
+
     def pad_embeds(self, embeds: PromptEmbeds):
         # ltx-2 connector requires 1024 tokens for good results. Any smaller and it degrades.
         target_length = 1024
@@ -887,16 +994,16 @@ class LTX2Model(BaseModel):
         **kwargs,
     ):
         verbose = self.model_config.verbose
-        print_verbose(verbose, f"get_noise_prediction() called: latent_input shape={latent_model_input.shape}, timestep={timestep}")
+        print_verbose(verbose, f"get_noise_prediction() called: latent_input shape={tuple(latent_model_input.shape)}, timestep={timestep}")
         with torch.no_grad():
             if self.model.device == torch.device("cpu"):
                 print_verbose(verbose, f"Moving transformer from CPU to {self.device_torch}")
                 self.model.to(self.device_torch)
                 print_verbose(verbose, f"Transformer moved to {self.device_torch}")
-                
+
             # We only encode and store the minimum prompt tokens, but need them padded to 1024 for LTX2
             text_embeddings = self.pad_embeds(text_embeddings)
-            print_verbose(verbose, f"Text embeddings padded, shape={text_embeddings.text_embeds.shape}")
+            print_verbose(verbose, f"Text embeddings padded, shape={tuple(text_embeddings.text_embeds.shape)}")
 
             batch_size, C, latent_num_frames, latent_height, latent_width = (
                 latent_model_input.shape
@@ -906,7 +1013,7 @@ class LTX2Model(BaseModel):
             video_timestep = timestep.clone()
 
             # i2v from first frame
-            if batch.dataset_config.do_i2v and batch.dataset_config.num_frames > 1:
+            if batch.dataset_config.do_i2v and batch.num_frames > 1:
                 print_verbose(verbose, f"Image-to-video mode: processing first frame conditioning")
                 # check to see if we had it cached
                 if batch.first_frame_latents is not None:
@@ -930,7 +1037,7 @@ class LTX2Model(BaseModel):
                     init_latents = self.encode_images(
                         first_frames, device=self.device_torch, dtype=self.torch_dtype
                     )
-                    print_verbose(verbose, f"First frame encoded, latents shape={init_latents.shape}")
+                    print_verbose(verbose, f"First frame encoded, latents shape={tuple(init_latents.shape)}")
 
                 # expand the latents to match video frames
                 init_latents = init_latents.repeat(1, 1, latent_num_frames, 1, 1)
@@ -949,17 +1056,22 @@ class LTX2Model(BaseModel):
 
                 # use conditioning mask to replace latents
                 latent_model_input = (
-                    latent_model_input * (1 - conditioning_mask)
-                    + init_latents * conditioning_mask
+                    init_latents * conditioning_mask
+                    + latent_model_input * (1 - conditioning_mask)
                 )
                 print_verbose(verbose, f"Applied first frame conditioning with mask")
 
-                # set video timestep
-                video_timestep = timestep.unsqueeze(-1) * (1 - conditioning_mask)
+                packed_conditioning_mask = self.pipeline._pack_latents(
+                    conditioning_mask,
+                    patch_size=self.pipeline.transformer_spatial_patch_size,
+                    patch_size_t=self.pipeline.transformer_temporal_patch_size,
+                )
 
-            # todo get this somehow
-            frame_rate = 24
-            print_verbose(verbose, f"Using frame_rate={frame_rate}")
+                # set video timestep
+                video_timestep = timestep.unsqueeze(-1) * (1 - packed_conditioning_mask)
+
+            frame_rate = batch.dataset_config.fps
+            print_verbose(verbose, f"Using frame_rate={frame_rate} (from dataset_config)")
             # check frame dimension
             # Unpacked latents of shape are [B, C, F, H, W] are patched into tokens of shape [B, C, F // p_t, p_t, H // p, p, W // p, p].
             packed_latents = self.pipeline._pack_latents(
@@ -967,7 +1079,7 @@ class LTX2Model(BaseModel):
                 patch_size=self.pipeline.transformer_spatial_patch_size,
                 patch_size_t=self.pipeline.transformer_temporal_patch_size,
             )
-            print_verbose(verbose, f"Latents packed, shape={packed_latents.shape}")
+            print_verbose(verbose, f"Latents packed, shape={tuple(packed_latents.shape)}")
 
             if batch.audio_latents is not None or batch.audio_tensor is not None:
                 print_verbose(verbose, f"Processing audio: has_cached_latents={batch.audio_latents is not None}, has_tensor={batch.audio_tensor is not None}")
@@ -976,13 +1088,13 @@ class LTX2Model(BaseModel):
                     raw_audio_latents = batch.audio_latents.to(
                         self.device_torch, dtype=self.torch_dtype
                     )
-                    print_verbose(verbose, f"Using cached audio latents, shape={raw_audio_latents.shape}")
+                    print_verbose(verbose, f"Using cached audio latents, shape={tuple(raw_audio_latents.shape)}")
                 else:
                     # we have audio waveforms to encode
                     # use audio from the batch if available
                     print_verbose(verbose, f"Encoding audio from batch")
                     raw_audio_latents = self.encode_audio(batch.audio_data)
-                    print_verbose(verbose, f"Audio encoded, latents shape={raw_audio_latents.shape}")
+                    print_verbose(verbose, f"Audio encoded, latents shape={tuple(raw_audio_latents.shape)}")
 
                 audio_num_frames = raw_audio_latents.shape[1]
                 # add the audio targets to the batch for loss calculation later
@@ -993,7 +1105,7 @@ class LTX2Model(BaseModel):
                     audio_noise,
                     timestep,
                 ).to(self.device_torch, dtype=self.torch_dtype)
-                print_verbose(verbose, f"Audio noise added, audio_latents shape={audio_latents.shape}, audio_num_frames={audio_num_frames}")
+                print_verbose(verbose, f"Audio noise added, audio_latents shape={tuple(audio_latents.shape)}, audio_num_frames={audio_num_frames}")
             else:
                 print_verbose(verbose, f"No audio in batch, preparing empty audio latents")
                 # no audio
@@ -1002,38 +1114,45 @@ class LTX2Model(BaseModel):
                 num_channels_latents_audio = (
                     self.pipeline.audio_vae.config.latent_channels
                 )
-                audio_latents, audio_num_frames = self.pipeline.prepare_audio_latents(
+                duration_s = batch.num_frames / frame_rate
+                audio_latents_per_second = (
+                    self.pipeline.audio_sampling_rate
+                    / self.pipeline.audio_hop_length
+                    / float(self.pipeline.audio_vae_temporal_compression_ratio)
+                )
+                audio_num_frames = round(duration_s * audio_latents_per_second)
+                audio_latents = self.pipeline.prepare_audio_latents(
                     batch_size,
                     num_channels_latents=num_channels_latents_audio,
+                    audio_latent_length=audio_num_frames,
                     num_mel_bins=num_mel_bins,
-                    num_frames=batch.dataset_config.num_frames,
-                    frame_rate=frame_rate,
-                    sampling_rate=self.pipeline.audio_sampling_rate,
-                    hop_length=self.pipeline.audio_hop_length,
+                    noise_scale=0.0,
                     dtype=torch.float32,
                     device=self.transformer.device,
                     generator=None,
                     latents=None,
                 )
-                print_verbose(verbose, f"Prepared empty audio latents, shape={audio_latents.shape}, audio_num_frames={audio_num_frames}")
+                print_verbose(verbose, f"Prepared empty audio latents, shape={tuple(audio_latents.shape)}, audio_num_frames={audio_num_frames}")
 
             if self.pipeline.connectors.device != self.transformer.device:
                 print_verbose(verbose, f"Moving connectors from {self.pipeline.connectors.device} to {self.transformer.device}")
                 self.pipeline.connectors.to(self.transformer.device)
 
-            # TODO this is how diffusers does this on inference, not sure I understand why, check this
-            additive_attention_mask = (
-                1 - text_embeddings.attention_mask.to(self.transformer.dtype)
-            ) * -1000000.0
-            print_verbose(verbose, f"Processing text embeddings through connectors")
+            # Padding side for default Gemma3-12B text encoder
+            tokenizer_padding_side = "left"
+            if getattr(self, "tokenizer", None) is not None:
+                tokenizer_padding_side = getattr(self.tokenizer, "padding_side", "left")
+            print_verbose(verbose, f"Processing text embeddings through connectors (padding_side={tokenizer_padding_side})")
             (
                 connector_prompt_embeds,
                 connector_audio_prompt_embeds,
                 connector_attention_mask,
             ) = self.pipeline.connectors(
-                text_embeddings.text_embeds, additive_attention_mask, additive_mask=True
+                text_embeddings.text_embeds,
+                text_embeddings.attention_mask.to(self.transformer.dtype),
+                padding_side=tokenizer_padding_side,
             )
-            print_verbose(verbose, f"Connector outputs: prompt_embeds shape={connector_prompt_embeds.shape}, audio_prompt_embeds shape={connector_audio_prompt_embeds.shape}")
+            print_verbose(verbose, f"Connector outputs: prompt_embeds shape={tuple(connector_prompt_embeds.shape)}, audio_prompt_embeds shape={tuple(connector_audio_prompt_embeds.shape)}")
 
             # compute video and audio positional ids
             video_coords = self.transformer.rope.prepare_video_coords(
@@ -1049,13 +1168,19 @@ class LTX2Model(BaseModel):
             )
             print_verbose(verbose, f"Prepared video and audio coordinates for transformer")
 
-        print_verbose(verbose, f"Running transformer forward pass")
+        # use_cross_timestep - Whether to use the cross modality (audio is the cross modality of video, and vice versa) sigma when
+        # calculating the cross attention modulation parameters. `True` is the newer (e.g. LTX-2.3) behavior;
+        # `False` is the legacy LTX-2.0 behavior.
+        use_cross_timestep = self.ltx_version == "2.3"
+        print_verbose(verbose, f"Running transformer forward pass (use_cross_timestep={use_cross_timestep})")
+
         noise_pred_video, noise_pred_audio = self.transformer(
             hidden_states=packed_latents,
             audio_hidden_states=audio_latents.to(self.transformer.dtype),
             encoder_hidden_states=connector_prompt_embeds,
             audio_encoder_hidden_states=connector_audio_prompt_embeds,
             timestep=video_timestep,
+            sigma=timestep,  # Used by LTX-2.3
             audio_timestep=timestep,
             encoder_attention_mask=connector_attention_mask,
             audio_encoder_attention_mask=connector_attention_mask,
@@ -1066,11 +1191,14 @@ class LTX2Model(BaseModel):
             audio_num_frames=audio_num_frames,
             video_coords=video_coords,
             audio_coords=audio_coords,
-            # rope_interpolation_scale=rope_interpolation_scale,
+            isolate_modalities=False,
+            spatio_temporal_guidance_blocks=None,
+            perturbation_mask=None,
+            use_cross_timestep=use_cross_timestep,
             attention_kwargs=None,
             return_dict=False,
         )
-        print_verbose(verbose, f"Transformer forward complete: noise_pred_video shape={noise_pred_video.shape}, noise_pred_audio shape={noise_pred_audio.shape}")
+        print_verbose(verbose, f"Transformer forward complete: noise_pred_video shape={tuple(noise_pred_video.shape)}, noise_pred_audio shape={tuple(noise_pred_audio.shape)}")
 
         # add audio latent to batch if we had audio
         if batch.audio_target is not None:
@@ -1085,7 +1213,7 @@ class LTX2Model(BaseModel):
             patch_size=self.pipeline.transformer_spatial_patch_size,
             patch_size_t=self.pipeline.transformer_temporal_patch_size,
         )
-        print_verbose(verbose, f"Unpacked latents, output shape={unpacked_output.shape}")
+        print_verbose(verbose, f"Unpacked latents, output shape={tuple(unpacked_output.shape)}")
         print_verbose(verbose, f"get_noise_prediction() completed")
 
         return unpacked_output
@@ -1118,8 +1246,8 @@ class LTX2Model(BaseModel):
         )
         text_input_ids = text_inputs.input_ids
         prompt_attention_mask = text_inputs.attention_mask
-        print_verbose(verbose, f"Tokenized prompts: input_ids shape={text_input_ids.shape}, attention_mask shape={prompt_attention_mask.shape}")
-        
+        print_verbose(verbose, f"Tokenized prompts: input_ids shape={tuple(text_input_ids.shape)}, attention_mask shape={tuple(prompt_attention_mask.shape)}")
+
         text_input_ids = text_input_ids.to(device)
         prompt_attention_mask = prompt_attention_mask.to(device)
 
@@ -1131,32 +1259,23 @@ class LTX2Model(BaseModel):
         )
         text_encoder_hidden_states = text_encoder_outputs.hidden_states
         text_encoder_hidden_states = torch.stack(text_encoder_hidden_states, dim=-1)
-        sequence_lengths = prompt_attention_mask.sum(dim=-1)
-        print_verbose(verbose, f"Text encoder output: hidden_states shape={text_encoder_hidden_states.shape}, sequence_lengths={sequence_lengths}")
-
-        prompt_embeds = self.pipeline._pack_text_embeds(
-            text_encoder_hidden_states,
-            sequence_lengths,
-            device=device,
-            padding_side=self.tokenizer[0].padding_side,
-            scale_factor=scale_factor,
-        )
-        prompt_embeds = prompt_embeds.to(dtype=self.torch_dtype)
-        print_verbose(verbose, f"Packed text embeds shape={prompt_embeds.shape}")
+        print_verbose(verbose, f"Text encoder output: hidden_states shape={tuple(text_encoder_hidden_states.shape)}")
+        prompt_embeds = text_encoder_hidden_states.flatten(2, 3).to(
+            dtype=self.torch_dtype
+        )  # Pack to 3D
+        print_verbose(verbose, f"Packed text embeds shape={tuple(prompt_embeds.shape)}")
 
         # duplicate text embeddings for each generation per prompt, using mps friendly method
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, 1, 1)
-        prompt_embeds = prompt_embeds.view(
-            batch_size * 1, seq_len, -1
-        )
+        prompt_embeds = prompt_embeds.view(batch_size * 1, seq_len, -1)
 
         prompt_attention_mask = prompt_attention_mask.view(batch_size, -1)
         prompt_attention_mask = prompt_attention_mask.repeat(1, 1)
-        
+
         pe = PromptEmbeds([prompt_embeds, None])
         pe.attention_mask = prompt_attention_mask
-        print_verbose(verbose, f"get_prompt_embeds() completed, final embeds shape={prompt_embeds.shape}")
+        print_verbose(verbose, f"get_prompt_embeds() completed, final embeds shape={tuple(prompt_embeds.shape)}")
         return pe
 
     def get_model_has_grad(self):
@@ -1200,13 +1319,21 @@ class LTX2Model(BaseModel):
         for key, value in state_dict.items():
             new_key = key.replace("transformer.", "diffusion_model.")
             new_sd[new_key] = value
-        new_sd = convert_lora_diffusers_to_original(new_sd)
+        new_sd = convert_lora_diffusers_to_original(new_sd, version=self.ltx_version)
         return new_sd
 
     def convert_lora_weights_before_load(self, state_dict):
-        state_dict = convert_lora_original_to_diffusers(state_dict)
+        state_dict = convert_lora_original_to_diffusers(
+            state_dict, version=self.ltx_version
+        )
         new_sd = {}
         for key, value in state_dict.items():
             new_key = key.replace("diffusion_model.", "transformer.")
             new_sd[new_key] = value
         return new_sd
+
+
+class LTX23Model(LTX2Model):
+    arch = "ltx2.3"
+    ltx_version = "2.3"
+    ltx_te_path = base_te_path

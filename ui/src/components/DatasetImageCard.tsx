@@ -62,10 +62,10 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   const [isCaptionModalOpen, setIsCaptionModalOpen] = useState<boolean>(false);
   const [isMoveModalOpen, setIsMoveModalOpen] = useState<boolean>(false);
   const [scores, setScores] = useState<Record<string, number> | null>(null);
-  const isGettingCaption = useRef<boolean>(false);
   const isGettingScores = useRef<boolean>(false);
   const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const didLongPress = useRef<boolean>(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     return () => {
@@ -76,15 +76,16 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   }, []);
 
   const fetchCaption = async (force = false) => {
-    if (isGettingCaption.current || (!force && isCaptionLoaded)) return;
-    isGettingCaption.current = true;
+    if (!force && isCaptionLoaded) return;
+    abortControllerRef.current?.abort();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     apiClient
-      .post(`/api/caption/get`, { imgPath: imageUrl })
+      .post(`/api/caption/get`, { imgPath: imageUrl }, { signal: controller.signal })
       .then(res => res.data)
       .then(data => {
         console.log('Caption fetched:', data);
         if (data) {
-          // fix issue where caption could be non string
           data = `${data}`;
         }
         setCaption(data || '');
@@ -92,10 +93,13 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
         setIsCaptionLoaded(true);
       })
       .catch(error => {
+        if (controller.signal.aborted) return;
         console.error('Error fetching caption:', error);
       })
       .finally(() => {
-        isGettingCaption.current = false;
+        if (abortControllerRef.current === controller) {
+          abortControllerRef.current = null;
+        }
       });
   };
 
@@ -153,7 +157,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
       fetchCaption();
       fetchScores();
     }
-  }, [inViewport, isVisible]);
+  }, [inViewport, isVisible, isCaptionLoaded]);
 
   // Re-fetch scores when scoreRefreshKey changes (e.g., after scoring completes)
   useEffect(() => {
@@ -167,7 +171,6 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   // Only re-fetch cards that don't yet have a saved caption
   useEffect(() => {
     if (captionRefreshKey && inViewport && isVisible && savedCaption === '') {
-      isGettingCaption.current = false;
       fetchCaption(true);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -185,6 +188,8 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
           }
         } else {
           setInViewport(false);
+          // Cancel any in-flight caption fetch when scrolling away
+          abortControllerRef.current?.abort();
         }
       },
       { threshold: 0.1 },
@@ -253,6 +258,8 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
 
   const isCaptionCurrent = caption.trim() === savedCaption;
 
+  const [showAudioPlayer, setShowAudioPlayer] = useState(true);
+
   const isItAVideo = isVideo(imageUrl);
   const isItAudio = isAudio(imageUrl);
   const isItImage = !isItAVideo && !isItAudio;
@@ -288,7 +295,22 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
                   controls
                 />
               )}
-              {isItAudio && (
+              {isItAudio && !showAudioPlayer && (
+                <div
+                  className="w-full h-full cursor-pointer flex items-center justify-center bg-gray-900"
+                  onClick={() => setShowAudioPlayer(true)}
+                >
+                  <img
+                    src={`/api/audio/art/${encodeURIComponent(imageUrl)}`}
+                    alt={alt}
+                    className="w-full h-full object-contain"
+                    onError={e => {
+                      (e.target as HTMLImageElement).style.display = 'none';
+                    }}
+                  />
+                </div>
+              )}
+              {isItAudio && showAudioPlayer && (
                 <AudioPlayer
                   src={`/api/img/${encodeURIComponent(imageUrl)}`}
                   title={imageUrl.replace(/^.*[\\/]/, '')}
@@ -423,43 +445,40 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
           </div>
           )}
         </div>
-        {inViewport && isVisible && !isItAudio && (
-          <div className="text-xs text-gray-100 bg-gray-950 mt-1 absolute bottom-0 left-0 p-1 opacity-25 hover:opacity-90 transition-opacity duration-300 w-full">
-            {imageUrl}
-          </div>
-        )}
       </div>
-      <div
-        className={classNames('w-full p-2 bg-gray-800 text-white text-sm rounded-b-lg h-[75px]', {
-          'border-blue-500 border-2': !isCaptionCurrent,
-          'border-transparent border-2': isCaptionCurrent,
-        })}
-      >
-        {inViewport && isVisible && isCaptionLoaded && (
-          <form
-            onSubmit={e => {
-              e.preventDefault();
-              saveCaption();
-            }}
-            onBlur={saveCaption}
-          >
-            <textarea
-              className="w-full bg-transparent resize-none outline-none focus:ring-0 focus:outline-none"
-              value={caption}
-              rows={3}
-              onChange={e => setCaption(e.target.value)}
-              onKeyDown={handleKeyDown}
-            />
-          </form>
-        )}
-        {(!inViewport || !isVisible) && isCaptionLoaded && (
-          <div className="w-full h-full flex items-center justify-center text-gray-400">
-            {isVisible ? 'Scroll into view to edit caption' : 'Show content to edit caption'}
-          </div>
-        )}
-        {!isCaptionLoaded && (
-          <div className="w-full h-full flex items-center justify-center text-gray-400">Loading caption...</div>
-        )}
+      <div className="relative w-full" style={{ height: '75px' }}>
+        <div
+          className={classNames('absolute inset-x-0 top-0 p-2 bg-gray-800 text-white text-sm rounded-b-lg h-[75px] hover:h-[150px] transition-[height] duration-300 ease-in-out z-20 overflow-hidden', {
+            'border-blue-500 border-2': !isCaptionCurrent,
+            'border-transparent border-2': isCaptionCurrent,
+          })}
+        >
+          {inViewport && isVisible && isCaptionLoaded && (
+            <form
+              className="h-full"
+              onSubmit={e => {
+                e.preventDefault();
+                saveCaption();
+              }}
+              onBlur={saveCaption}
+            >
+              <textarea
+                className="w-full h-full bg-transparent resize-none outline-none focus:ring-0 focus:outline-none"
+                value={caption}
+                onChange={e => setCaption(e.target.value)}
+                onKeyDown={handleKeyDown}
+              />
+            </form>
+          )}
+          {(!inViewport || !isVisible) && isCaptionLoaded && (
+            <div className="w-full h-full flex items-center justify-center text-gray-400">
+              {isVisible ? 'Scroll into view to edit caption' : 'Show content to edit caption'}
+            </div>
+          )}
+          {!isCaptionLoaded && (
+            <div className="w-full h-full flex items-center justify-center text-gray-400">Loading caption...</div>
+          )}
+        </div>
       </div>
       {scores && Object.keys(scores).length > 0 && (
         <div className="w-full px-2 py-1 bg-gray-900 rounded-b-lg flex flex-wrap gap-1">

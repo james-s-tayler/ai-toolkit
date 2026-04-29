@@ -11,6 +11,7 @@ interface CaptioningState {
   total: number;
   error?: string;
   process?: ChildProcess;
+  downloading?: boolean;
 }
 
 // In-memory store for captioning state per dataset
@@ -19,6 +20,8 @@ const captioningStates = new Map<string, CaptioningState>();
 const CAPTIONABLE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp', '.mp4', '.avi', '.mov', '.mkv', '.wmv', '.m4v', '.flv', '.webm'];
 
 const ALLOWED_MODELS = new Set([
+  'Qwen/Qwen3-VL-4B-Instruct',
+  'Qwen/Qwen3-VL-8B-Instruct',
   'prithivMLmods/Qwen3-VL-4B-Instruct-abliterated-v1',
   'prithivMLmods/Qwen3-VL-8B-Abliterated-Caption-it',
 ]);
@@ -73,12 +76,13 @@ export async function GET(request: Request) {
     captioned: state.captioned,
     total: state.total,
     error: state.error,
+    downloading: state.downloading,
   });
 }
 
 export async function POST(request: Request) {
   const body = await request.json();
-  const { datasetName, triggerWord, systemPrompt, modelId } = body;
+  const { datasetName, triggerWord, systemPrompt, modelId, useQuorum } = body;
 
   if (!datasetName || typeof datasetName !== 'string' || datasetName.trim() === '') {
     return NextResponse.json({ error: 'Invalid dataset name' }, { status: 400 });
@@ -87,7 +91,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Invalid dataset name' }, { status: 400 });
   }
 
-  const resolvedModelId = modelId || 'prithivMLmods/Qwen3-VL-4B-Instruct-abliterated-v1';
+  const resolvedModelId = modelId || 'Qwen/Qwen3-VL-4B-Instruct';
   if (!ALLOWED_MODELS.has(resolvedModelId)) {
     return NextResponse.json({ error: 'Invalid model ID' }, { status: 400 });
   }
@@ -131,6 +135,7 @@ export async function POST(request: Request) {
     trigger_word: (triggerWord || '').toString(),
     system_prompt: (systemPrompt || '').toString(),
     model_id: resolvedModelId,
+    ...(useQuorum ? { quorum: true } : {}),
   });
   proc.stdin.write(input);
   proc.stdin.end();
@@ -142,7 +147,10 @@ export async function POST(request: Request) {
     stdoutBuffer = lines.pop() ?? '';
     for (const line of lines) {
       const trimmed = line.trim();
-      if (trimmed.startsWith('PROGRESS:')) {
+      if (trimmed === 'STATUS:downloading') {
+        state.downloading = true;
+      } else if (trimmed.startsWith('PROGRESS:')) {
+        state.downloading = false;
         const parts = trimmed.split(':');
         if (parts.length === 3) {
           state.captioned = parseInt(parts[1], 10);
@@ -184,7 +192,11 @@ export async function POST(request: Request) {
     }
   });
 
-  return NextResponse.json({ status: 'running', captioned: 0, total });
+  return NextResponse.json({
+    status: 'running',
+    captioned: 0,
+    total,
+  });
 }
 
 export async function DELETE(request: Request) {

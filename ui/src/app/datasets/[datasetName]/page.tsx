@@ -1,19 +1,20 @@
 'use client';
 
 import { useEffect, useState, use, useMemo, useCallback, useRef } from 'react';
-import { LuImageOff, LuLoader, LuBan, LuFolderOpen } from 'react-icons/lu';
-import { FaChevronLeft, FaTrashAlt, FaTimes, FaObjectGroup, FaArrowsAlt, FaCodeBranch } from 'react-icons/fa';
+import { LuImageOff, LuLoader, LuBan, LuFolderOpen, LuUpload } from 'react-icons/lu';
+import { FaChevronLeft, FaTrashAlt, FaTimes, FaObjectGroup, FaArrowsAlt, FaCodeBranch, FaEraser, FaStickyNote } from 'react-icons/fa';
+import { openConfirm } from '@/components/ConfirmModal';
 import DatasetImageCard from '@/components/DatasetImageCard';
 import DatasetImageViewer from '@/components/DatasetImageViewer';
 import { Button } from '@headlessui/react';
-import AddImagesModal, { openImagesModal } from '@/components/AddImagesModal';
+import AddImagesModal, { openImagesModal, useOpenImagesModalOnDrag } from '@/components/AddImagesModal';
 import BulkCaptionModal from '@/components/BulkCaptionModal';
 import MoveImageModal from '@/components/MoveImageModal';
 import BulkSplitModal from '@/components/BulkSplitModal';
 import { TopBar, MainContent } from '@/components/layout';
 import { apiClient } from '@/utils/api';
 import { isAudio, isVideo, formatDuration } from '@/utils/basic';
-import FullscreenDropOverlay from '@/components/FullscreenDropOverlay';
+import DatasetNotesModal from '@/components/DatasetNotesModal';
 
 interface ImageMetadataEntry {
   img_path: string;
@@ -35,6 +36,7 @@ interface CaptioningStatus {
   captioned: number;
   total: number;
   error?: string;
+  downloading?: boolean;
 }
 
 export default function DatasetPage({ params }: { params: { datasetName: string } }) {
@@ -53,6 +55,7 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
   const [isBulkCaptionModalOpen, setIsBulkCaptionModalOpen] = useState(false);
   const [isBulkMoveModalOpen, setIsBulkMoveModalOpen] = useState(false);
   const [isBulkSplitModalOpen, setIsBulkSplitModalOpen] = useState(false);
+  const [isNotesModalOpen, setIsNotesModalOpen] = useState(false);
   const captioningPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const prevCaptionedCountRef = useRef<number>(0);
   const [captionRefreshKey, setCaptionRefreshKey] = useState<number>(0);
@@ -95,6 +98,8 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
         setStatus('error');
       });
   };
+  useOpenImagesModalOnDrag(datasetName, () => refreshImageList(datasetName));
+
   useEffect(() => {
     if (datasetName) {
       refreshImageList(datasetName);
@@ -349,7 +354,7 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
   }, [stopCaptioningPoll]);
 
   const handleStartCaptioning = useCallback(
-    async (options: { modelId: string; triggerWord: string; systemPrompt: string }) => {
+    async (options: { modelId: string; triggerWord: string; systemPrompt: string; useQuorum: boolean }) => {
       setIsBulkCaptionModalOpen(false);
       try {
         const res = await apiClient.post('/api/datasets/captionImages', {
@@ -357,6 +362,7 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
           triggerWord: options.triggerWord,
           systemPrompt: options.systemPrompt,
           modelId: options.modelId,
+          useQuorum: options.useQuorum,
         });
         const data: CaptioningStatus = res.data;
         setCaptioningStatus(data);
@@ -394,27 +400,27 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
       text = 'Loading Images';
       subtitle = 'Please wait while we fetch your dataset images...';
       showIt = true;
-      bgColor = 'bg-gray-50 dark:bg-gray-800/50';
-      textColor = 'text-gray-900 dark:text-gray-100';
-      iconColor = 'text-gray-500 dark:text-gray-400';
+      bgColor = 'bg-gray-800/50';
+      textColor = 'text-gray-100';
+      iconColor = 'text-gray-400';
     }
     if (status == 'error') {
       icon = <LuBan className="w-8 h-8" />;
       text = 'Error Loading Images';
       subtitle = 'There was a problem fetching the images. Please try refreshing the page.';
       showIt = true;
-      bgColor = 'bg-red-50 dark:bg-red-950/20';
-      textColor = 'text-red-900 dark:text-red-100';
-      iconColor = 'text-red-600 dark:text-red-400';
+      bgColor = 'bg-red-600/20';
+      textColor = 'text-red-100';
+      iconColor = 'text-red-400';
     }
     if (status == 'success' && imgList.length === 0) {
       icon = <LuImageOff className="w-8 h-8" />;
       text = 'No Images Found';
       subtitle = 'This dataset is empty. Click "Add Images" to get started.';
       showIt = true;
-      bgColor = 'bg-gray-50 dark:bg-gray-800/50';
-      textColor = 'text-gray-900 dark:text-gray-100';
-      iconColor = 'text-gray-500 dark:text-gray-400';
+      bgColor = 'bg-gray-800/50';
+      textColor = 'text-gray-100';
+      iconColor = 'text-gray-400';
     }
 
     if (!showIt) return null;
@@ -536,6 +542,29 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
                 </Button>
               )}
               <Button
+                className="text-gray-200 bg-slate-600 px-3 py-1 rounded-md flex items-center gap-2"
+                onClick={() => {
+                  openConfirm({
+                    title: 'Clear Captions',
+                    message: `Are you sure you want to delete all caption files in "${datasetName}"? This action cannot be undone.`,
+                    type: 'warning',
+                    confirmText: 'Clear All',
+                    onConfirm: () => {
+                      apiClient
+                        .post('/api/datasets/clearCaptions', { datasetName })
+                        .then(() => {
+                          setCaptionRefreshKey(k => k + 1);
+                          refreshImageList(datasetName);
+                        })
+                        .catch(error => console.error('Error clearing captions:', error));
+                    },
+                  });
+                }}
+              >
+                <FaEraser />
+                Clear Captions
+              </Button>
+              <Button
                 className="text-gray-200 bg-slate-600 px-3 py-1 rounded-md"
                 onClick={() => openImagesModal(datasetName, () => refreshImageList(datasetName))}
               >
@@ -543,10 +572,45 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
               </Button>
               <Button
                 className="text-gray-200 bg-slate-600 px-3 py-1 rounded-md flex items-center gap-2"
+                onClick={() => {
+                  openConfirm({
+                    title: 'Export to ComfyUI',
+                    message: `Export dataset "${datasetName}" to the ComfyUI input directory?`,
+                    type: 'info',
+                    confirmText: 'Export',
+                    onConfirm: () => {
+                      apiClient
+                        .post('/api/comfyui/export', { datasetName })
+                        .catch(error => {
+                          console.error('Error exporting to ComfyUI:', error);
+                          openConfirm({
+                            title: 'Export Failed',
+                            message: error?.response?.data?.error || 'Failed to export dataset to ComfyUI.',
+                            type: 'danger',
+                            confirmText: 'OK',
+                            onConfirm: () => {},
+                          });
+                        });
+                    },
+                  });
+                }}
+              >
+                <LuUpload />
+                Export to ComfyUI
+              </Button>
+              <Button
+                className="text-gray-200 bg-slate-600 px-3 py-1 rounded-md flex items-center gap-2"
                 onClick={() => apiClient.post('/api/open-folder', { datasetName }).catch(error => console.error('Error opening folder:', error))}
               >
                 <LuFolderOpen />
                 Open Folder
+              </Button>
+              <Button
+                className="text-gray-200 bg-slate-600 px-3 py-1 rounded-md flex items-center gap-2"
+                onClick={() => setIsNotesModalOpen(true)}
+              >
+                <FaStickyNote />
+                Notes
               </Button>
             </div>
           </>
@@ -569,16 +633,24 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
         )}
         {captioningStatus?.status === 'running' && (
           <div className="mb-4">
-            <div className="flex justify-between text-sm text-gray-400 mb-1">
-              <span>Captioning images...</span>
-              <span>{captioningStatus.captioned} / {captioningStatus.total}</span>
-            </div>
-            <div className="w-full bg-gray-700 rounded-full h-2">
-              <div
-                className="bg-blue-500 h-2 rounded-full transition-all duration-300"
-                style={{ width: captioningStatus.total > 0 ? `${(captioningStatus.captioned / captioningStatus.total) * 100}%` : '0%' }}
-              />
-            </div>
+            {captioningStatus.downloading ? (
+              <p className="text-sm text-gray-400">
+                Downloading model (this may take &gt; 15 minutes). Captioning will start once download finishes.
+              </p>
+            ) : (
+              <>
+                <div className="flex justify-between text-sm text-gray-400 mb-1">
+                  <span>Captioning images...</span>
+                  <span>{captioningStatus.captioned} / {captioningStatus.total}</span>
+                </div>
+                <div className="w-full bg-gray-700 rounded-full h-2">
+                  <div
+                    className="bg-blue-500 h-2 rounded-full transition-all duration-300"
+                    style={{ width: captioningStatus.total > 0 ? `${(captioningStatus.captioned / captioningStatus.total) * 100}%` : '0%' }}
+                  />
+                </div>
+              </>
+            )}
           </div>
         )}
         {isSelectMode && (
@@ -664,9 +736,10 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
         images={sortedImgList.map(img => img.img_path).filter(path => !isAudio(path))}
         onChange={setSelectedImage}
       />
-      <FullscreenDropOverlay
+      <DatasetNotesModal
+        isOpen={isNotesModalOpen}
+        onClose={() => setIsNotesModalOpen(false)}
         datasetName={datasetName}
-        onComplete={() => refreshImageList(datasetName)}
       />
     </>
   );

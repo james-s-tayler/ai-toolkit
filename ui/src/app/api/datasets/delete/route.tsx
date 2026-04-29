@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
-import { getDatasetsRoot } from '@/server/settings';
+import { getDatasetsRoot, getDataRoot } from '@/server/settings';
 
 export async function POST(request: Request) {
   try {
@@ -16,9 +16,21 @@ export async function POST(request: Request) {
     }
 
     // delete it and return success
-    fs.rmdirSync(datasetPath, { recursive: true });
+    fs.rmSync(datasetPath, { recursive: true, force: true });
+
+    // Also delete associated notes file if it exists
+    try {
+      const dataRoot = await getDataRoot();
+      const notesPath = path.join(dataRoot, 'notes', `${name}.txt`);
+      if (fs.existsSync(notesPath)) {
+        fs.unlinkSync(notesPath);
+      }
+    } catch (notesError) {
+      console.error('Error deleting notes file:', notesError);
+    }
+
     return NextResponse.json({ success: true });
   } catch (error) {
-    return NextResponse.json({ error: 'Failed to create dataset' }, { status: 500 });
+    return NextResponse.json({ error: 'Failed to delete dataset' }, { status: 500 });
   }
 }
