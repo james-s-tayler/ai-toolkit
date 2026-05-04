@@ -1,5 +1,5 @@
 'use client';
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { Dialog, DialogBackdrop, DialogPanel, DialogTitle } from '@headlessui/react';
 import { FaComment } from 'react-icons/fa';
@@ -30,9 +30,13 @@ export default function CaptionModal({ imageUrl, isOpen, onClose, onCaptionGener
   const [systemPrompt, setSystemPrompt] = useState(DEFAULT_SYSTEM_PROMPT);
   const [modelId, setModelId] = useState(MODEL_LITE);
   const [useQuorum, setUseQuorum] = useState(false);
+  const [videoFps, setVideoFps] = useState(2.0);
+  const [videoMaxFrames, setVideoMaxFrames] = useState(8);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [isDownloading, setIsDownloading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [generatedCaption, setGeneratedCaption] = useState<string | null>(null);
+  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [presets, setPresets] = useState<CaptionPreset[]>([]);
   const [activePreset, setActivePreset] = useState<CaptionPreset | null>(null);
   const [variableSelections, setVariableSelections] = useState<Record<string, number>>({});
@@ -45,42 +49,93 @@ export default function CaptionModal({ imageUrl, isOpen, onClose, onCaptionGener
     }).catch(() => {});
   }, []);
 
-  useEffect(() => {
-    if (!isOpen) {
-      setError(null);
-      setGeneratedCaption(null);
-      setIsGenerating(false);
-    }
-  }, [isOpen]);
-
   const handleClose = useCallback(() => {
     if (!isGenerating) {
       onClose();
     }
   }, [isGenerating, onClose]);
 
+  const stopPolling = useCallback(() => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isOpen) {
+      stopPolling();
+      setError(null);
+      setGeneratedCaption(null);
+      setIsGenerating(false);
+      setIsDownloading(false);
+    }
+  }, [isOpen, stopPolling]);
+
+  useEffect(() => () => stopPolling(), [stopPolling]);
+
+  const handleCancel = useCallback(async () => {
+    if (!isGenerating) {
+      onClose();
+      return;
+    }
+    stopPolling();
+    try {
+      await apiClient.delete(`/api/img/ai-caption?imgPath=${encodeURIComponent(imageUrl)}`);
+    } catch {
+      // best-effort cancel
+    }
+    setIsGenerating(false);
+    setIsDownloading(false);
+    onClose();
+  }, [isGenerating, imageUrl, stopPolling, onClose]);
+
   const handleGenerate = async () => {
     setIsGenerating(true);
+    setIsDownloading(false);
     setError(null);
     setGeneratedCaption(null);
     try {
-      const res = await apiClient.post('/api/img/ai-caption', {
+      await apiClient.post('/api/img/ai-caption', {
         imgPath: imageUrl,
         triggerWord: triggerWord.trim(),
         systemPrompt: systemPrompt.trim(),
         modelId,
         useQuorum,
+        videoFps,
+        videoMaxFrames,
       });
-      const caption = res.data?.caption ?? '';
-      setGeneratedCaption(caption);
-      onCaptionGenerated?.(caption);
-      onClose();
     } catch (err: any) {
-      const msg = err?.response?.data?.error || 'Failed to generate caption';
+      const msg = err?.response?.data?.error || 'Failed to start captioning';
       setError(msg);
-    } finally {
       setIsGenerating(false);
+      return;
     }
+
+    // Poll status until completed, error, or cancelled.
+    pollIntervalRef.current = setInterval(async () => {
+      try {
+        const poll = await apiClient.get(`/api/img/ai-caption?imgPath=${encodeURIComponent(imageUrl)}`);
+        const data = poll.data as { status: string; downloading?: boolean; caption?: string; error?: string };
+        setIsDownloading(!!data.downloading);
+        if (data.status === 'completed') {
+          stopPolling();
+          const caption = data.caption ?? '';
+          setGeneratedCaption(caption);
+          onCaptionGenerated?.(caption);
+          setIsGenerating(false);
+          setIsDownloading(false);
+          onClose();
+        } else if (data.status === 'error' || data.status === 'cancelled') {
+          stopPolling();
+          setError(data.error || 'Captioning failed');
+          setIsGenerating(false);
+          setIsDownloading(false);
+        }
+      } catch {
+        // transient poll failure — keep trying
+      }
+    }, 1000);
   };
 
   if (!mounted) return null;
@@ -141,6 +196,43 @@ export default function CaptionModal({ imageUrl, isOpen, onClose, onCaptionGener
                   </label>
                   <p className="mt-1 text-xs text-gray-500">
                     Generates 5 candidate captions and synthesizes a final caption from elements common to at least 3 of 5. Slower but more accurate.
+                  </p>
+                </div>
+
+                <div>
+                  <label className="block text-sm text-gray-400 mb-1">Video Settings</label>
+                  <div className="flex gap-3">
+                    <div className="flex-1">
+                      <label className="block text-xs text-gray-500 mb-1">Sample FPS</label>
+                      <input
+                        type="number"
+                        min={0.5}
+                        max={8}
+                        step={0.5}
+                        value={videoFps}
+                        onChange={e => setVideoFps(parseFloat(e.target.value) || 2.0)}
+                        disabled={isGenerating}
+                        className="w-full bg-gray-700 text-white text-sm rounded px-3 py-2 disabled:opacity-50"
+                        aria-label="Video sample FPS"
+                      />
+                    </div>
+                    <div className="flex-1">
+                      <label className="block text-xs text-gray-500 mb-1">Max Frames</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={32}
+                        step={1}
+                        value={videoMaxFrames}
+                        onChange={e => setVideoMaxFrames(parseInt(e.target.value, 10) || 8)}
+                        disabled={isGenerating}
+                        className="w-full bg-gray-700 text-white text-sm rounded px-3 py-2 disabled:opacity-50"
+                        aria-label="Video max frames"
+                      />
+                    </div>
+                  </div>
+                  <p className="mt-1 text-xs text-gray-500">
+                    Only used when captioning videos. Defaults (2 fps × 8 frames) give ~8 evenly-spaced frames across a 5-second clip, which is the sweet spot for caption quality. Raise max frames for fast-motion clips; lower it for mostly-static shots. Raising fps above 2 has little effect once max frames binds.
                   </p>
                 </div>
 
@@ -234,6 +326,14 @@ export default function CaptionModal({ imageUrl, isOpen, onClose, onCaptionGener
                   </div>
                 )}
 
+                {isGenerating && (
+                  <div className="text-sm text-gray-400">
+                    {isDownloading
+                      ? 'Downloading model (this may take > 15 minutes). Captioning will start once download finishes.'
+                      : 'Generating caption…'}
+                  </div>
+                )}
+
                 {error && <div className="text-sm text-red-400">{error}</div>}
               </div>
             </div>
@@ -241,9 +341,8 @@ export default function CaptionModal({ imageUrl, isOpen, onClose, onCaptionGener
             <div className="bg-gray-700 px-6 py-3 flex justify-end gap-3">
               <button
                 type="button"
-                onClick={handleClose}
-                disabled={isGenerating}
-                className="rounded-md bg-gray-800 px-3 py-2 text-sm font-semibold text-gray-200 hover:bg-gray-900 disabled:opacity-50 disabled:cursor-not-allowed"
+                onClick={handleCancel}
+                className="rounded-md bg-gray-800 px-3 py-2 text-sm font-semibold text-gray-200 hover:bg-gray-900"
               >
                 {generatedCaption !== null ? 'Close' : 'Cancel'}
               </button>

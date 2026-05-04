@@ -147,6 +147,17 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
       });
   };
 
+  const rotateVideo = (direction: 'left' | 'right') => {
+    apiClient
+      .post('/api/video/rotate', { videoPath: imageUrl, direction })
+      .then(() => {
+        setVideoKey(Date.now());
+      })
+      .catch(error => {
+        console.error('Error rotating video:', error);
+      });
+  };
+
   const handleVideoEdit = () => {
     setIsVideoEditOpen(true);
   };
@@ -374,6 +385,24 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
                 className="bg-gray-800 rounded-full p-2"
                 onClick={() => rotateImage('right')}
                 aria-label="Rotate image right"
+              >
+                <FaRedoAlt />
+              </button>
+            )}
+            {isItAVideo && (
+              <button
+                className="bg-gray-800 rounded-full p-2"
+                onClick={() => rotateVideo('left')}
+                aria-label="Rotate video left"
+              >
+                <FaUndoAlt />
+              </button>
+            )}
+            {isItAVideo && (
+              <button
+                className="bg-gray-800 rounded-full p-2"
+                onClick={() => rotateVideo('right')}
+                aria-label="Rotate video right"
               >
                 <FaRedoAlt />
               </button>

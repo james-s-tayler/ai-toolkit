@@ -72,6 +72,9 @@ def download_model_with_progress(model_id):
     except Exception:
         pass
 
+    # Signal to the calling route that we're about to download (mirrors bulk script).
+    print('STATUS:downloading', flush=True)
+
     # Get total download size
     try:
         info = hf_model_info(model_id)
@@ -132,29 +135,6 @@ def download_model_with_progress(model_id):
     print(f'\nDownload complete.', file=sys.stderr, flush=True)
 
 
-def get_video_middle_frame(video_path: str):
-    """Extract the middle frame from a video file."""
-    import cv2
-    from PIL import Image
-
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {video_path}")
-
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    mid_frame = max(0, total_frames // 2)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, mid_frame)
-    ret, frame = cap.read()
-    cap.release()
-
-    if not ret:
-        raise RuntimeError("Could not read frame from video")
-
-    # Convert BGR to RGB
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(frame_rgb)
-
-
 QUORUM_SYNTHESIS_PROMPT = (
     "Below are 5 candidate captions for this image. Generate a final caption "
     "using ONLY details that appear in at least 3 of the 5 candidates. "
@@ -165,7 +145,15 @@ QUORUM_SYNTHESIS_PROMPT = (
 QUORUM_TEMPERATURES = [0.6, 0.7, 0.8, 0.9, 1.0]
 
 
-def caption_image(img_path: str, trigger_word: str, system_prompt: str, model_id: str, quorum: bool = False) -> str:
+def caption_image(
+    img_path: str,
+    trigger_word: str,
+    system_prompt: str,
+    model_id: str,
+    quorum: bool = False,
+    video_fps: float = 2.0,
+    video_max_frames: int = 8,
+) -> str:
     """Generate a caption for an image or video using Qwen3-VL."""
     from PIL import Image
     import torch
@@ -177,11 +165,12 @@ def caption_image(img_path: str, trigger_word: str, system_prompt: str, model_id
     ext = os.path.splitext(img_path)[1].lower()
     is_video = ext in video_extensions
 
-    # Load image or extract middle frame from video
+    # Images are loaded as PIL up front; videos are passed by path so qwen_vl_utils
+    # can sample frames natively via its torchcodec/decord/torchvision backend.
     if is_video:
-        image = get_video_middle_frame(img_path)
+        media = img_path
     else:
-        image = Image.open(img_path).convert("RGB")
+        media = Image.open(img_path).convert("RGB")
 
     trigger = trigger_word.strip() if trigger_word and trigger_word.strip() else ""
 
@@ -231,20 +220,36 @@ def caption_image(img_path: str, trigger_word: str, system_prompt: str, model_id
 
     processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
 
-    def _generate_single(image_obj, text_instruction, temperature=0.7, greedy=False):
+    def _generate_single(media_obj, text_instruction, temperature=0.7, greedy=False):
         """Run a single generation pass and return the decoded caption."""
+        if is_video:
+            media_content = {
+                "type": "video",
+                "video": media_obj,
+                "fps": video_fps,
+                "max_frames": video_max_frames,
+            }
+        else:
+            media_content = {"type": "image", "image": media_obj}
+
         msgs = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "image", "image": image_obj},
+                    media_content,
                     {"type": "text", "text": text_instruction},
                 ],
             }
         ]
         t_in = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-        i_in, _ = process_vision_info(msgs)
-        inp = processor(text=[t_in], images=i_in, padding=True, return_tensors="pt").to(device)
+        image_inputs, video_inputs = process_vision_info(msgs)
+        inp = processor(
+            text=[t_in],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        ).to(device)
 
         gen_kwargs = dict(
             max_new_tokens=1024,
@@ -268,7 +273,7 @@ def caption_image(img_path: str, trigger_word: str, system_prompt: str, model_id
         # Generate 5 candidate captions at varying temperatures
         candidates = []
         for temp in QUORUM_TEMPERATURES:
-            c = _generate_single(image, instruction, temperature=temp)
+            c = _generate_single(media, instruction, temperature=temp)
             if c:
                 candidates.append(c)
 
@@ -278,16 +283,16 @@ def caption_image(img_path: str, trigger_word: str, system_prompt: str, model_id
             synthesis_instruction = f"{QUORUM_SYNTHESIS_PROMPT}\n\n{numbered}"
             if trigger:
                 synthesis_instruction += f"\n\nStart the response with: {trigger}"
-            caption = _generate_single(image, synthesis_instruction, greedy=True)
+            caption = _generate_single(media, synthesis_instruction, greedy=True)
         else:
             # Not enough candidates, use whatever we got
             caption = candidates[0] if candidates else ""
     else:
-        caption = _generate_single(image, instruction)
+        caption = _generate_single(media, instruction)
 
         # Retry with greedy decoding if caption is too short or lazy
         if not caption or len(caption) < 30:
-            caption = _generate_single(image, instruction, greedy=True)
+            caption = _generate_single(media, instruction, greedy=True)
 
     # Fallback if still empty
     if not caption:
@@ -323,6 +328,18 @@ def main():
         action="store_true",
         help="Generate 5 candidate captions and synthesize a final caption from common elements",
     )
+    parser.add_argument(
+        "--video_fps",
+        type=float,
+        default=2.0,
+        help="Frame sample rate for video inputs (frames per second). Ignored for images.",
+    )
+    parser.add_argument(
+        "--video_max_frames",
+        type=int,
+        default=8,
+        help="Maximum frames sampled from a video. Ignored for images.",
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.img_path):
@@ -330,7 +347,15 @@ def main():
         sys.exit(1)
 
     try:
-        caption = caption_image(args.img_path, args.trigger_word, args.system_prompt, args.model_id, quorum=args.quorum)
+        caption = caption_image(
+            args.img_path,
+            args.trigger_word,
+            args.system_prompt,
+            args.model_id,
+            quorum=args.quorum,
+            video_fps=args.video_fps,
+            video_max_frames=args.video_max_frames,
+        )
         print(json.dumps({"caption": caption}))
     except Exception as e:
         print(json.dumps({"error": str(e)}), file=sys.stderr)
