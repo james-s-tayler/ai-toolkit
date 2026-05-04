@@ -72,6 +72,9 @@ def download_model_with_progress(model_id):
     except Exception:
         pass
 
+    # Signal to the calling route that we're about to download (mirrors bulk script).
+    print('STATUS:downloading', flush=True)
+
     # Get total download size
     try:
         info = hf_model_info(model_id)
