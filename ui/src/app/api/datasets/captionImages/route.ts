@@ -82,7 +82,7 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   const body = await request.json();
-  const { datasetName, triggerWord, systemPrompt, modelId, useQuorum } = body;
+  const { datasetName, triggerWord, systemPrompt, modelId, useQuorum, videoFps, videoMaxFrames } = body;
 
   if (!datasetName || typeof datasetName !== 'string' || datasetName.trim() === '') {
     return NextResponse.json({ error: 'Invalid dataset name' }, { status: 400 });
@@ -94,6 +94,17 @@ export async function POST(request: Request) {
   const resolvedModelId = modelId || 'Qwen/Qwen3-VL-4B-Instruct';
   if (!ALLOWED_MODELS.has(resolvedModelId)) {
     return NextResponse.json({ error: 'Invalid model ID' }, { status: 400 });
+  }
+
+  const resolvedVideoFps = typeof videoFps === 'number' && Number.isFinite(videoFps) ? videoFps : 2.0;
+  if (resolvedVideoFps < 0.1 || resolvedVideoFps > 16) {
+    return NextResponse.json({ error: 'videoFps must be between 0.1 and 16' }, { status: 400 });
+  }
+  const resolvedVideoMaxFrames = typeof videoMaxFrames === 'number' && Number.isInteger(videoMaxFrames)
+    ? videoMaxFrames
+    : 8;
+  if (resolvedVideoMaxFrames < 1 || resolvedVideoMaxFrames > 64) {
+    return NextResponse.json({ error: 'videoMaxFrames must be between 1 and 64' }, { status: 400 });
   }
 
   const datasetsPath = await getDatasetsRoot();
@@ -135,6 +146,8 @@ export async function POST(request: Request) {
     trigger_word: (triggerWord || '').toString(),
     system_prompt: (systemPrompt || '').toString(),
     model_id: resolvedModelId,
+    video_fps: resolvedVideoFps,
+    video_max_frames: resolvedVideoMaxFrames,
     ...(useQuorum ? { quorum: true } : {}),
   });
   proc.stdin.write(input);

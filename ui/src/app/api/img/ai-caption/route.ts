@@ -19,7 +19,7 @@ const ALLOWED_MODELS = new Set([
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const { imgPath, triggerWord, systemPrompt, modelId, useQuorum } = body;
+    const { imgPath, triggerWord, systemPrompt, modelId, useQuorum, videoFps, videoMaxFrames } = body;
 
     if (!imgPath || typeof imgPath !== 'string') {
       return NextResponse.json({ error: 'imgPath is required' }, { status: 400 });
@@ -33,6 +33,17 @@ export async function POST(request: Request) {
     const resolvedModelId = modelId || 'prithivMLmods/Qwen3-VL-4B-Instruct-abliterated-v1';
     if (!ALLOWED_MODELS.has(resolvedModelId)) {
       return NextResponse.json({ error: 'Invalid model ID' }, { status: 400 });
+    }
+
+    const resolvedVideoFps = typeof videoFps === 'number' && Number.isFinite(videoFps) ? videoFps : 2.0;
+    if (resolvedVideoFps < 0.1 || resolvedVideoFps > 16) {
+      return NextResponse.json({ error: 'videoFps must be between 0.1 and 16' }, { status: 400 });
+    }
+    const resolvedVideoMaxFrames = typeof videoMaxFrames === 'number' && Number.isInteger(videoMaxFrames)
+      ? videoMaxFrames
+      : 8;
+    if (resolvedVideoMaxFrames < 1 || resolvedVideoMaxFrames > 64) {
+      return NextResponse.json({ error: 'videoMaxFrames must be between 1 and 64' }, { status: 400 });
     }
 
     const datasetsPath = await getDatasetsRoot();
@@ -56,6 +67,8 @@ export async function POST(request: Request) {
       '--trigger_word', (triggerWord || '').toString(),
       '--system_prompt', (systemPrompt || '').toString(),
       '--model_id', resolvedModelId,
+      '--video_fps', resolvedVideoFps.toString(),
+      '--video_max_frames', resolvedVideoMaxFrames.toString(),
       ...(useQuorum ? ['--quorum'] : []),
     ];
 

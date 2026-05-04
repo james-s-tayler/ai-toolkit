@@ -9,7 +9,14 @@ import { type CaptionPreset, applySelections, getActiveVariables } from '@/utils
 interface BulkCaptionModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onStart: (options: { modelId: string; triggerWord: string; systemPrompt: string; useQuorum: boolean }) => void;
+  onStart: (options: {
+    modelId: string;
+    triggerWord: string;
+    systemPrompt: string;
+    useQuorum: boolean;
+    videoFps: number;
+    videoMaxFrames: number;
+  }) => void;
 }
 
 const MODEL_OPTIONS = [
@@ -27,6 +34,8 @@ export default function BulkCaptionModal({ isOpen, onClose, onStart }: BulkCapti
   const [systemPrompt, setSystemPrompt] = useState(DEFAULT_SYSTEM_PROMPT);
   const [modelId, setModelId] = useState(MODEL_OPTIONS[0].value);
   const [useQuorum, setUseQuorum] = useState(false);
+  const [videoFps, setVideoFps] = useState(2.0);
+  const [videoMaxFrames, setVideoMaxFrames] = useState(8);
   const [presets, setPresets] = useState<CaptionPreset[]>([]);
   const [activePreset, setActivePreset] = useState<CaptionPreset | null>(null);
   const [variableSelections, setVariableSelections] = useState<Record<string, number>>({});
@@ -45,14 +54,23 @@ export default function BulkCaptionModal({ isOpen, onClose, onStart }: BulkCapti
       setSystemPrompt(DEFAULT_SYSTEM_PROMPT);
       setModelId(MODEL_OPTIONS[0].value);
       setUseQuorum(false);
+      setVideoFps(2.0);
+      setVideoMaxFrames(8);
       setActivePreset(null);
       setVariableSelections({});
     }
   }, [isOpen]);
 
   const handleStart = useCallback(() => {
-    onStart({ modelId, triggerWord: triggerWord.trim(), systemPrompt: systemPrompt.trim(), useQuorum });
-  }, [modelId, triggerWord, systemPrompt, useQuorum, onStart]);
+    onStart({
+      modelId,
+      triggerWord: triggerWord.trim(),
+      systemPrompt: systemPrompt.trim(),
+      useQuorum,
+      videoFps,
+      videoMaxFrames,
+    });
+  }, [modelId, triggerWord, systemPrompt, useQuorum, videoFps, videoMaxFrames, onStart]);
 
   if (!mounted) return null;
 
@@ -104,6 +122,41 @@ export default function BulkCaptionModal({ isOpen, onClose, onStart }: BulkCapti
                   </label>
                   <p className="mt-1 text-xs text-gray-500">
                     Generates 5 candidate captions and synthesizes a final caption from elements common to at least 3 of 5. Slower but more accurate.
+                  </p>
+                </div>
+
+                <div>
+                  <label className="block text-sm text-gray-400 mb-1">Video Settings</label>
+                  <div className="flex gap-3">
+                    <div className="flex-1">
+                      <label className="block text-xs text-gray-500 mb-1">Sample FPS</label>
+                      <input
+                        type="number"
+                        min={0.5}
+                        max={8}
+                        step={0.5}
+                        value={videoFps}
+                        onChange={e => setVideoFps(parseFloat(e.target.value) || 2.0)}
+                        className="w-full bg-gray-700 text-white text-sm rounded px-3 py-2"
+                        aria-label="Video sample FPS"
+                      />
+                    </div>
+                    <div className="flex-1">
+                      <label className="block text-xs text-gray-500 mb-1">Max Frames</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={32}
+                        step={1}
+                        value={videoMaxFrames}
+                        onChange={e => setVideoMaxFrames(parseInt(e.target.value, 10) || 8)}
+                        className="w-full bg-gray-700 text-white text-sm rounded px-3 py-2"
+                        aria-label="Video max frames"
+                      />
+                    </div>
+                  </div>
+                  <p className="mt-1 text-xs text-gray-500">
+                    Only used when captioning videos. Defaults (2 fps × 8 frames) give ~8 evenly-spaced frames across a 5-second clip, which is the sweet spot for caption quality. Raise max frames for fast-motion clips; lower it for mostly-static shots. Raising fps above 2 has little effect once max frames binds.
                   </p>
                 </div>
 

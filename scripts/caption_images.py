@@ -48,24 +48,6 @@ def get_txt_path(img_path: str) -> str:
     return base + '.txt'
 
 
-def get_video_middle_frame(video_path: str):
-    import cv2
-    from PIL import Image
-
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {video_path}")
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    mid_frame = max(0, total_frames // 2)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, mid_frame)
-    ret, frame = cap.read()
-    cap.release()
-    if not ret:
-        raise RuntimeError("Could not read frame from video")
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(frame_rgb)
-
-
 def build_instruction(trigger: str, lora_focus: str) -> str:
     if lora_focus:
         if trigger:
@@ -80,26 +62,40 @@ def build_instruction(trigger: str, lora_focus: str) -> str:
     return CORE_CAPTION_INSTRUCTION
 
 
-def _generate_single(model, processor, device, image, text_instruction, temperature=0.7, greedy=False):
+def _generate_single(
+    model, processor, device, media, is_video, video_fps, video_max_frames,
+    text_instruction, temperature=0.7, greedy=False,
+):
     """Run a single generation pass and return the decoded caption."""
     from qwen_vl_utils import process_vision_info
     import torch
+
+    if is_video:
+        media_content = {
+            "type": "video",
+            "video": media,
+            "fps": video_fps,
+            "max_frames": video_max_frames,
+        }
+    else:
+        media_content = {"type": "image", "image": media}
 
     messages = [
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": image},
+                media_content,
                 {"type": "text", "text": text_instruction},
             ],
         }
     ]
 
     text_in = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    img_in, _ = process_vision_info(messages)
+    image_inputs, video_inputs = process_vision_info(messages)
     inputs = processor(
         text=[text_in],
-        images=img_in,
+        images=image_inputs,
+        videos=video_inputs,
         padding=True,
         return_tensors="pt",
     ).to(device)
@@ -123,12 +119,21 @@ def _generate_single(model, processor, device, image, text_instruction, temperat
     )[0].strip()
 
 
-def generate_caption(model, processor, device, image, instruction: str, trigger: str, quorum: bool = False) -> str:
+def generate_caption(
+    model, processor, device, media, is_video, video_fps, video_max_frames,
+    instruction: str, trigger: str, quorum: bool = False,
+) -> str:
+    def _gen(text_instruction, temperature=0.7, greedy=False):
+        return _generate_single(
+            model, processor, device, media, is_video, video_fps, video_max_frames,
+            text_instruction, temperature=temperature, greedy=greedy,
+        )
+
     if quorum:
         # Generate 5 candidate captions at varying temperatures
         candidates = []
         for temp in QUORUM_TEMPERATURES:
-            c = _generate_single(model, processor, device, image, instruction, temperature=temp)
+            c = _gen(instruction, temperature=temp)
             if c:
                 candidates.append(c)
 
@@ -137,15 +142,15 @@ def generate_caption(model, processor, device, image, instruction: str, trigger:
             synthesis_instruction = f"{QUORUM_SYNTHESIS_PROMPT}\n\n{numbered}"
             if trigger:
                 synthesis_instruction += f"\n\nStart the response with: {trigger}"
-            caption = _generate_single(model, processor, device, image, synthesis_instruction, greedy=True)
+            caption = _gen(synthesis_instruction, greedy=True)
         else:
             caption = candidates[0] if candidates else ""
     else:
-        caption = _generate_single(model, processor, device, image, instruction)
+        caption = _gen(instruction)
 
         # Retry with greedy decoding if too short or lazy
         if not caption or len(caption) < 30:
-            caption = _generate_single(model, processor, device, image, instruction, greedy=True)
+            caption = _gen(instruction, greedy=True)
 
     if not caption:
         caption = (
@@ -167,6 +172,8 @@ def main():
     system_prompt = data.get('system_prompt', '').strip()
     model_id = data.get('model_id', MODEL_LITE)
     quorum = data.get('quorum', False)
+    video_fps = float(data.get('video_fps', 2.0))
+    video_max_frames = int(data.get('video_max_frames', 8))
 
     if model_id not in ALLOWED_MODELS:
         model_id = MODEL_LITE
@@ -223,12 +230,17 @@ def main():
     for img_path in image_paths:
         try:
             ext = os.path.splitext(img_path)[1].lower()
-            if ext in VIDEO_EXTENSIONS:
-                image = get_video_middle_frame(img_path)
+            is_video = ext in VIDEO_EXTENSIONS
+            if is_video:
+                # Pass the path; qwen_vl_utils samples frames natively.
+                media = img_path
             else:
-                image = Image.open(img_path).convert('RGB')
+                media = Image.open(img_path).convert('RGB')
 
-            caption = generate_caption(model, processor, device, image, instruction, trigger_word, quorum=quorum)
+            caption = generate_caption(
+                model, processor, device, media, is_video, video_fps, video_max_frames,
+                instruction, trigger_word, quorum=quorum,
+            )
 
             txt_path = get_txt_path(img_path)
             with open(txt_path, 'w', encoding='utf-8') as f:

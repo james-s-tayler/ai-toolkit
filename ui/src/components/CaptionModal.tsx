@@ -30,6 +30,8 @@ export default function CaptionModal({ imageUrl, isOpen, onClose, onCaptionGener
   const [systemPrompt, setSystemPrompt] = useState(DEFAULT_SYSTEM_PROMPT);
   const [modelId, setModelId] = useState(MODEL_LITE);
   const [useQuorum, setUseQuorum] = useState(false);
+  const [videoFps, setVideoFps] = useState(2.0);
+  const [videoMaxFrames, setVideoMaxFrames] = useState(8);
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [generatedCaption, setGeneratedCaption] = useState<string | null>(null);
@@ -70,6 +72,8 @@ export default function CaptionModal({ imageUrl, isOpen, onClose, onCaptionGener
         systemPrompt: systemPrompt.trim(),
         modelId,
         useQuorum,
+        videoFps,
+        videoMaxFrames,
       });
       const caption = res.data?.caption ?? '';
       setGeneratedCaption(caption);
@@ -141,6 +145,43 @@ export default function CaptionModal({ imageUrl, isOpen, onClose, onCaptionGener
                   </label>
                   <p className="mt-1 text-xs text-gray-500">
                     Generates 5 candidate captions and synthesizes a final caption from elements common to at least 3 of 5. Slower but more accurate.
+                  </p>
+                </div>
+
+                <div>
+                  <label className="block text-sm text-gray-400 mb-1">Video Settings</label>
+                  <div className="flex gap-3">
+                    <div className="flex-1">
+                      <label className="block text-xs text-gray-500 mb-1">Sample FPS</label>
+                      <input
+                        type="number"
+                        min={0.5}
+                        max={8}
+                        step={0.5}
+                        value={videoFps}
+                        onChange={e => setVideoFps(parseFloat(e.target.value) || 2.0)}
+                        disabled={isGenerating}
+                        className="w-full bg-gray-700 text-white text-sm rounded px-3 py-2 disabled:opacity-50"
+                        aria-label="Video sample FPS"
+                      />
+                    </div>
+                    <div className="flex-1">
+                      <label className="block text-xs text-gray-500 mb-1">Max Frames</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={32}
+                        step={1}
+                        value={videoMaxFrames}
+                        onChange={e => setVideoMaxFrames(parseInt(e.target.value, 10) || 8)}
+                        disabled={isGenerating}
+                        className="w-full bg-gray-700 text-white text-sm rounded px-3 py-2 disabled:opacity-50"
+                        aria-label="Video max frames"
+                      />
+                    </div>
+                  </div>
+                  <p className="mt-1 text-xs text-gray-500">
+                    Only used when captioning videos. Defaults (2 fps × 8 frames) give ~8 evenly-spaced frames across a 5-second clip, which is the sweet spot for caption quality. Raise max frames for fast-motion clips; lower it for mostly-static shots. Raising fps above 2 has little effect once max frames binds.
                   </p>
                 </div>
 
