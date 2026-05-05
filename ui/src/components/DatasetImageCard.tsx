@@ -562,8 +562,12 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
         isOpen={isCaptionModalOpen}
         onClose={() => setIsCaptionModalOpen(false)}
         onCaptionGenerated={(newCaption) => {
-          setCaption(newCaption);
-          setSavedCaption(newCaption);
+          const trimmed = newCaption.trim();
+          setCaption(trimmed);
+          apiClient
+            .post('/api/img/caption', { imgPath: imageUrl, caption: trimmed })
+            .then(() => setSavedCaption(trimmed))
+            .catch(error => console.error('Error saving caption:', error));
         }}
       />
       <MoveImageModal
