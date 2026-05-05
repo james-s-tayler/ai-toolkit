@@ -1,11 +1,12 @@
 import React, { useRef, useEffect, useState, ReactNode, KeyboardEvent } from 'react';
-import { FaTrashAlt, FaEye, FaEyeSlash, FaExpand, FaUndoAlt, FaRedoAlt, FaCheckCircle, FaCut, FaObjectGroup, FaComment, FaArrowsAlt, FaMusic } from 'react-icons/fa';
+import { FaTrashAlt, FaEye, FaEyeSlash, FaExpand, FaUndoAlt, FaRedoAlt, FaCheckCircle, FaCut, FaObjectGroup, FaComment, FaArrowsAlt, FaMusic, FaImages } from 'react-icons/fa';
 import classNames from 'classnames';
 import { apiClient } from '@/utils/api';
 import AudioPlayer from './AudioPlayer';
 import VideoTrimModal from './VideoTrimModal';
 import CaptionModal from './CaptionModal';
 import MoveImageModal from './MoveImageModal';
+import FrameExtractModal from './FrameExtractModal';
 import { isVideo, isAudio } from '@/utils/basic';
 
 interface DatasetImageCardProps {
@@ -20,6 +21,7 @@ interface DatasetImageCardProps {
   onEnlarge?: () => void;
   onMove?: (operation: 'move' | 'copy') => void;
   onExtractAudio?: () => void;
+  onExtractFrames?: (destinationDataset: string) => void;
   currentDataset?: string;
   selected?: boolean;
   isSelectMode?: boolean;
@@ -41,6 +43,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   onEnlarge,
   onMove,
   onExtractAudio,
+  onExtractFrames,
   currentDataset = '',
   selected = false,
   isSelectMode = false,
@@ -61,6 +64,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   const [isVideoEditOpen, setIsVideoEditOpen] = useState<boolean>(false);
   const [isCaptionModalOpen, setIsCaptionModalOpen] = useState<boolean>(false);
   const [isMoveModalOpen, setIsMoveModalOpen] = useState<boolean>(false);
+  const [isFrameExtractOpen, setIsFrameExtractOpen] = useState<boolean>(false);
   const [scores, setScores] = useState<Record<string, number> | null>(null);
   const isGettingScores = useRef<boolean>(false);
   const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -234,7 +238,8 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
     }
   };
 
-  const handlePointerDown = () => {
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if ((e.target as HTMLElement).closest('button, textarea, input, select, a')) return;
     didLongPress.current = false;
     longPressTimer.current = setTimeout(() => {
       didLongPress.current = true;
@@ -443,6 +448,15 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
                 <FaMusic />
               </button>
             )}
+            {isItAVideo && (
+              <button
+                className="bg-gray-800 rounded-full p-2"
+                onClick={() => setIsFrameExtractOpen(true)}
+                aria-label="Extract frames from video"
+              >
+                <FaImages />
+              </button>
+            )}
             <button
               className="bg-gray-800 rounded-full p-2"
               onClick={() => setIsCaptionModalOpen(true)}
@@ -529,6 +543,18 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
           onClose={() => setIsVideoEditOpen(false)}
           onTrim={() => { setIsVideoEditOpen(false); setVideoKey(Date.now()); onTrim?.(); }}
           onSplit={() => { setIsVideoEditOpen(false); onSplit?.(); }}
+        />
+      )}
+      {isItAVideo && (
+        <FrameExtractModal
+          isOpen={isFrameExtractOpen}
+          onClose={() => setIsFrameExtractOpen(false)}
+          videoPaths={[imageUrl]}
+          currentDataset={currentDataset}
+          onComplete={destination => {
+            setIsFrameExtractOpen(false);
+            onExtractFrames?.(destination);
+          }}
         />
       )}
       <CaptionModal
