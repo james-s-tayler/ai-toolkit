@@ -2,7 +2,7 @@
 
 import { useEffect, useState, use, useMemo, useCallback, useRef } from 'react';
 import { LuImageOff, LuLoader, LuBan, LuFolderOpen, LuUpload } from 'react-icons/lu';
-import { FaChevronLeft, FaTrashAlt, FaTimes, FaObjectGroup, FaArrowsAlt, FaCodeBranch, FaEraser, FaStickyNote } from 'react-icons/fa';
+import { FaChevronLeft, FaTrashAlt, FaTimes, FaObjectGroup, FaArrowsAlt, FaCodeBranch, FaEraser, FaStickyNote, FaImages } from 'react-icons/fa';
 import { openConfirm } from '@/components/ConfirmModal';
 import DatasetImageCard from '@/components/DatasetImageCard';
 import DatasetImageViewer from '@/components/DatasetImageViewer';
@@ -11,6 +11,7 @@ import AddImagesModal, { openImagesModal, useOpenImagesModalOnDrag } from '@/com
 import BulkCaptionModal from '@/components/BulkCaptionModal';
 import MoveImageModal from '@/components/MoveImageModal';
 import BulkSplitModal from '@/components/BulkSplitModal';
+import FrameExtractModal from '@/components/FrameExtractModal';
 import { TopBar, MainContent } from '@/components/layout';
 import { apiClient } from '@/utils/api';
 import { isAudio, isVideo, formatDuration } from '@/utils/basic';
@@ -55,6 +56,7 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
   const [isBulkCaptionModalOpen, setIsBulkCaptionModalOpen] = useState(false);
   const [isBulkMoveModalOpen, setIsBulkMoveModalOpen] = useState(false);
   const [isBulkSplitModalOpen, setIsBulkSplitModalOpen] = useState(false);
+  const [isFrameExtractModalOpen, setIsFrameExtractModalOpen] = useState(false);
   const [isNotesModalOpen, setIsNotesModalOpen] = useState(false);
   const captioningPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const prevCaptionedCountRef = useRef<number>(0);
@@ -481,6 +483,15 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
                       Split Videos
                     </Button>
                   )}
+                  {allSelectedAreVideos && (
+                    <Button
+                      className="text-gray-200 bg-blue-700 px-3 py-1 rounded-md flex items-center gap-2"
+                      onClick={() => setIsFrameExtractModalOpen(true)}
+                    >
+                      <FaImages />
+                      Extract Frames
+                    </Button>
+                  )}
                   <Button
                     className="text-gray-200 bg-blue-700 px-3 py-1 rounded-md flex items-center gap-2 disabled:opacity-50"
                     onClick={() => setIsBulkMoveModalOpen(true)}
@@ -697,6 +708,9 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
                   onMerge={() => handleMergeStart(img.img_path)}
                   onEnlarge={() => setSelectedImage(img.img_path)}
                   onExtractAudio={() => refreshImageList(datasetName)}
+                  onExtractFrames={destination => {
+                    if (destination === datasetName) refreshImageList(datasetName);
+                  }}
                   isSelectMode={isSelectMode}
                   selected={selectedImages.has(img.img_path)}
                   onLongPress={() => handleLongPress(img.img_path)}
@@ -738,6 +752,18 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
           setSelectedImages(new Set());
           setIsBulkSplitModalOpen(false);
           refreshImageList(datasetName);
+        }}
+      />
+      <FrameExtractModal
+        isOpen={isFrameExtractModalOpen}
+        onClose={() => setIsFrameExtractModalOpen(false)}
+        videoPaths={Array.from(selectedImages).filter(p => isVideo(p))}
+        currentDataset={datasetName}
+        onComplete={destination => {
+          setIsSelectMode(false);
+          setSelectedImages(new Set());
+          setIsFrameExtractModalOpen(false);
+          if (destination === datasetName) refreshImageList(datasetName);
         }}
       />
       <DatasetImageViewer
