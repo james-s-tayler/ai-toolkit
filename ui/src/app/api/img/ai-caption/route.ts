@@ -8,6 +8,8 @@ import { TOOLKIT_ROOT } from '@/paths';
 const SCRIPT_PATH = path.join(TOOLKIT_ROOT, 'scripts', 'caption_image.py');
 
 const ALLOWED_MODELS = new Set([
+  'Qwen/Qwen3-VL-4B-Instruct',
+  'Qwen/Qwen3-VL-8B-Instruct',
   'prithivMLmods/Qwen3-VL-4B-Instruct-abliterated-v1',
   'prithivMLmods/Qwen3-VL-8B-Abliterated-Caption-it',
 ]);

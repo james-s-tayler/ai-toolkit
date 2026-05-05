@@ -13,12 +13,11 @@ interface CaptionModalProps {
   onCaptionGenerated?: (caption: string) => void;
 }
 
-const MODEL_LITE = 'prithivMLmods/Qwen3-VL-4B-Instruct-abliterated-v1';
-const MODEL_FULL = 'prithivMLmods/Qwen3-VL-8B-Abliterated-Caption-it';
-
 const MODEL_OPTIONS = [
-  { value: MODEL_LITE, label: 'Qwen3-VL-4B-Instruct-abliterated-v1 (~5–8 GB VRAM, fast)' },
-  { value: MODEL_FULL, label: 'Qwen3-VL-8B-Instruct-abliterated-v1 (~10–14 GB VRAM, max quality)' },
+  { value: 'Qwen/Qwen3-VL-4B-Instruct', label: 'Qwen3-VL-4B-Instruct (~5–8 GB VRAM)' },
+  { value: 'Qwen/Qwen3-VL-8B-Instruct', label: 'Qwen3-VL-8B-Instruct (~10–14 GB VRAM)' },
+  { value: 'prithivMLmods/Qwen3-VL-4B-Instruct-abliterated-v1', label: 'Qwen3-VL-4B-Instruct-abliterated (~5–8 GB VRAM)' },
+  { value: 'prithivMLmods/Qwen3-VL-8B-Abliterated-Caption-it', label: 'Qwen3-VL-8B-Abliterated-Caption-it (~10–14 GB VRAM)' },
 ];
 
 const DEFAULT_SYSTEM_PROMPT =
@@ -28,7 +27,7 @@ export default function CaptionModal({ imageUrl, isOpen, onClose, onCaptionGener
   const [mounted, setMounted] = useState(false);
   const [triggerWord, setTriggerWord] = useState('');
   const [systemPrompt, setSystemPrompt] = useState(DEFAULT_SYSTEM_PROMPT);
-  const [modelId, setModelId] = useState(MODEL_LITE);
+  const [modelId, setModelId] = useState(MODEL_OPTIONS[0].value);
   const [useQuorum, setUseQuorum] = useState(false);
   const [videoFps, setVideoFps] = useState(2.0);
   const [videoMaxFrames, setVideoMaxFrames] = useState(8);
