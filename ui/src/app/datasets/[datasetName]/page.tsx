@@ -2,7 +2,7 @@
 
 import { useEffect, useState, use, useMemo, useCallback, useRef } from 'react';
 import { LuImageOff, LuLoader, LuBan, LuFolderOpen, LuUpload } from 'react-icons/lu';
-import { FaChevronLeft, FaTrashAlt, FaTimes, FaObjectGroup, FaArrowsAlt, FaCodeBranch, FaEraser, FaStickyNote, FaImages } from 'react-icons/fa';
+import { FaChevronLeft, FaTrashAlt, FaTimes, FaObjectGroup, FaArrowsAlt, FaCodeBranch, FaEraser, FaStickyNote, FaImages, FaCheckSquare, FaUserAlt } from 'react-icons/fa';
 import { openConfirm } from '@/components/ConfirmModal';
 import DatasetImageCard from '@/components/DatasetImageCard';
 import DatasetImageViewer from '@/components/DatasetImageViewer';
@@ -12,6 +12,7 @@ import BulkCaptionModal from '@/components/BulkCaptionModal';
 import MoveImageModal from '@/components/MoveImageModal';
 import BulkSplitModal from '@/components/BulkSplitModal';
 import FrameExtractModal from '@/components/FrameExtractModal';
+import FaceExtractModal from '@/components/FaceExtractModal';
 import { TopBar, MainContent } from '@/components/layout';
 import { apiClient } from '@/utils/api';
 import { isAudio, isVideo, formatDuration } from '@/utils/basic';
@@ -57,6 +58,7 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
   const [isBulkMoveModalOpen, setIsBulkMoveModalOpen] = useState(false);
   const [isBulkSplitModalOpen, setIsBulkSplitModalOpen] = useState(false);
   const [isFrameExtractModalOpen, setIsFrameExtractModalOpen] = useState(false);
+  const [isFaceExtractModalOpen, setIsFaceExtractModalOpen] = useState(false);
   const [isNotesModalOpen, setIsNotesModalOpen] = useState(false);
   const captioningPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const prevCaptionedCountRef = useRef<number>(0);
@@ -216,8 +218,11 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
     return list;
   }, [imgList, sortBy, imageMetadata]);
 
+  const prevSelectedSizeRef = useRef<number>(0);
   useEffect(() => {
-    if (isSelectMode && selectedImages.size === 0) {
+    const prev = prevSelectedSizeRef.current;
+    prevSelectedSizeRef.current = selectedImages.size;
+    if (isSelectMode && prev > 0 && selectedImages.size === 0) {
       setIsSelectMode(false);
       setIsMergeMode(false);
     }
@@ -225,6 +230,11 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
 
   const allSelectedAreVideos = useMemo(
     () => selectedImages.size > 0 && Array.from(selectedImages).every(p => isVideo(p)),
+    [selectedImages],
+  );
+
+  const allSelectedAreImages = useMemo(
+    () => selectedImages.size > 0 && Array.from(selectedImages).every(p => !isVideo(p) && !isAudio(p)),
     [selectedImages],
   );
 
@@ -492,6 +502,15 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
                       Extract Frames
                     </Button>
                   )}
+                  {allSelectedAreImages && (
+                    <Button
+                      className="text-gray-200 bg-blue-700 px-3 py-1 rounded-md flex items-center gap-2"
+                      onClick={() => setIsFaceExtractModalOpen(true)}
+                    >
+                      <FaUserAlt />
+                      Extract Faces
+                    </Button>
+                  )}
                   <Button
                     className="text-gray-200 bg-blue-700 px-3 py-1 rounded-md flex items-center gap-2 disabled:opacity-50"
                     onClick={() => setIsBulkMoveModalOpen(true)}
@@ -531,6 +550,17 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
             </div>
             <div className="flex-1"></div>
             <div className="flex gap-2">
+              <Button
+                className="text-gray-200 bg-slate-600 px-3 py-1 rounded-md flex items-center gap-2"
+                onClick={() => {
+                  setIsSelectMode(true);
+                  setSelectedImages(new Set());
+                }}
+                disabled={imgList.length === 0}
+              >
+                <FaCheckSquare />
+                Multi-Select
+              </Button>
               {scoringStatus?.status === 'running' ? (
                 <Button
                   className="text-gray-200 bg-red-700 px-3 py-1 rounded-md"
@@ -711,6 +741,9 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
                   onExtractFrames={destination => {
                     if (destination === datasetName) refreshImageList(datasetName);
                   }}
+                  onExtractFaces={destination => {
+                    if (destination === datasetName) refreshImageList(datasetName);
+                  }}
                   isSelectMode={isSelectMode}
                   selected={selectedImages.has(img.img_path)}
                   onLongPress={() => handleLongPress(img.img_path)}
@@ -763,6 +796,18 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
           setIsSelectMode(false);
           setSelectedImages(new Set());
           setIsFrameExtractModalOpen(false);
+          if (destination === datasetName) refreshImageList(datasetName);
+        }}
+      />
+      <FaceExtractModal
+        isOpen={isFaceExtractModalOpen}
+        onClose={() => setIsFaceExtractModalOpen(false)}
+        imagePaths={Array.from(selectedImages).filter(p => !isVideo(p) && !isAudio(p))}
+        currentDataset={datasetName}
+        onComplete={destination => {
+          setIsSelectMode(false);
+          setSelectedImages(new Set());
+          setIsFaceExtractModalOpen(false);
           if (destination === datasetName) refreshImageList(datasetName);
         }}
       />
