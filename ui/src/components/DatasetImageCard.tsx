@@ -1,5 +1,5 @@
 import React, { useRef, useEffect, useState, ReactNode, KeyboardEvent } from 'react';
-import { FaTrashAlt, FaEye, FaEyeSlash, FaExpand, FaUndoAlt, FaRedoAlt, FaCheckCircle, FaCut, FaObjectGroup, FaComment, FaArrowsAlt, FaMusic, FaImages } from 'react-icons/fa';
+import { FaTrashAlt, FaEye, FaEyeSlash, FaExpand, FaUndoAlt, FaRedoAlt, FaCheckCircle, FaCut, FaObjectGroup, FaComment, FaArrowsAlt, FaMusic, FaImages, FaUserAlt } from 'react-icons/fa';
 import classNames from 'classnames';
 import { apiClient } from '@/utils/api';
 import AudioPlayer from './AudioPlayer';
@@ -7,6 +7,7 @@ import VideoTrimModal from './VideoTrimModal';
 import CaptionModal from './CaptionModal';
 import MoveImageModal from './MoveImageModal';
 import FrameExtractModal from './FrameExtractModal';
+import FaceExtractModal from './FaceExtractModal';
 import { isVideo, isAudio } from '@/utils/basic';
 
 interface DatasetImageCardProps {
@@ -22,6 +23,7 @@ interface DatasetImageCardProps {
   onMove?: (operation: 'move' | 'copy') => void;
   onExtractAudio?: () => void;
   onExtractFrames?: (destinationDataset: string) => void;
+  onExtractFaces?: (destinationDataset: string, totalFaces: number) => void;
   currentDataset?: string;
   selected?: boolean;
   isSelectMode?: boolean;
@@ -44,6 +46,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   onMove,
   onExtractAudio,
   onExtractFrames,
+  onExtractFaces,
   currentDataset = '',
   selected = false,
   isSelectMode = false,
@@ -65,6 +68,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   const [isCaptionModalOpen, setIsCaptionModalOpen] = useState<boolean>(false);
   const [isMoveModalOpen, setIsMoveModalOpen] = useState<boolean>(false);
   const [isFrameExtractOpen, setIsFrameExtractOpen] = useState<boolean>(false);
+  const [isFaceExtractOpen, setIsFaceExtractOpen] = useState<boolean>(false);
   const [scores, setScores] = useState<Record<string, number> | null>(null);
   const isGettingScores = useRef<boolean>(false);
   const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -394,6 +398,15 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
                 <FaRedoAlt />
               </button>
             )}
+            {isItImage && (
+              <button
+                className="bg-gray-800 rounded-full p-2"
+                onClick={() => setIsFaceExtractOpen(true)}
+                aria-label="Extract faces from image"
+              >
+                <FaUserAlt />
+              </button>
+            )}
             {isItAVideo && (
               <button
                 className="bg-gray-800 rounded-full p-2"
@@ -554,6 +567,18 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
           onComplete={destination => {
             setIsFrameExtractOpen(false);
             onExtractFrames?.(destination);
+          }}
+        />
+      )}
+      {isItImage && (
+        <FaceExtractModal
+          isOpen={isFaceExtractOpen}
+          onClose={() => setIsFaceExtractOpen(false)}
+          imagePaths={[imageUrl]}
+          currentDataset={currentDataset}
+          onComplete={(destination, totalFaces) => {
+            setIsFaceExtractOpen(false);
+            onExtractFaces?.(destination, totalFaces);
           }}
         />
       )}

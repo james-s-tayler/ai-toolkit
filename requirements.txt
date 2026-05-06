@@ -4,3 +4,5 @@ yt-dlp[default,curl-cffi]
 piq
 aesthetic_predictor_v2_5
 qwen-vl-utils
+insightface
+onnxruntime
