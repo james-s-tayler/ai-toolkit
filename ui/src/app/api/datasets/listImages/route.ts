@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
 import { getDatasetsRoot } from '@/server/settings';
+import { isCacheFile } from '@/utils/mediaMetadata';
 
 export async function POST(request: Request) {
   const datasetsPath = await getDatasetsRoot();
@@ -50,6 +51,7 @@ function findImagesRecursively(dir: string): string[] {
       results = results.concat(findImagesRecursively(itemPath));
     } else {
       // If it's a file, check if it's an image and not trashed
+      if (isCacheFile(item)) continue;
       const ext = path.extname(itemPath).toLowerCase();
       if (imageExtensions.includes(ext) && !item.startsWith('trash_') && !item.startsWith('.')) {
         results.push(itemPath);

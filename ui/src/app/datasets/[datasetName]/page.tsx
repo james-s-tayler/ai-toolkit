@@ -23,6 +23,7 @@ interface ImageMetadataEntry {
   duration?: number;
   width?: number;
   height?: number;
+  fps?: number;
   scores?: Record<string, number>;
 }
 
@@ -160,13 +161,16 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
     ];
     const hasVideos = imgList.some(img => isVideo(img.img_path));
     const hasImages = imgList.some(img => !isVideo(img.img_path) && !isAudio(img.img_path));
+    const hasResolutions = (hasVideos || hasImages) && Object.values(imageMetadata).some(m => m.width && m.height);
     if (hasVideos) {
       options.push({ value: 'duration:asc', label: 'Duration (Lowest to Highest)' });
       options.push({ value: 'duration:desc', label: 'Duration (Highest to Lowest)' });
     }
-    if (hasImages) {
+    if (hasResolutions) {
       options.push({ value: 'resolution:asc', label: 'Resolution (Small to Large)' });
       options.push({ value: 'resolution:desc', label: 'Resolution (Large to Small)' });
+    }
+    if (hasImages) {
       const metrics = new Set<string>();
       for (const meta of Object.values(imageMetadata)) {
         if (meta.scores) {
@@ -750,6 +754,7 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
                   onSelect={() => handleSelect(img.img_path)}
                   scoreRefreshKey={scoreRefreshKey}
                   captionRefreshKey={captionRefreshKey}
+                  metadata={imageMetadata[img.img_path]}
                 />
               ))}
             </div>
