@@ -2,7 +2,7 @@
 
 import { useEffect, useState, use, useMemo, useCallback, useRef } from 'react';
 import { LuImageOff, LuLoader, LuBan, LuFolderOpen, LuUpload } from 'react-icons/lu';
-import { FaChevronLeft, FaTrashAlt, FaTimes, FaObjectGroup, FaArrowsAlt, FaCodeBranch, FaEraser, FaStickyNote, FaImages, FaCheckSquare, FaUserAlt } from 'react-icons/fa';
+import { FaChevronLeft, FaTrashAlt, FaTimes, FaObjectGroup, FaArrowsAlt, FaCodeBranch, FaEraser, FaStickyNote, FaImages, FaCheckSquare, FaUserAlt, FaTachometerAlt } from 'react-icons/fa';
 import { openConfirm } from '@/components/ConfirmModal';
 import DatasetImageCard from '@/components/DatasetImageCard';
 import DatasetImageViewer from '@/components/DatasetImageViewer';
@@ -11,6 +11,7 @@ import AddImagesModal, { openImagesModal, useOpenImagesModalOnDrag } from '@/com
 import BulkCaptionModal from '@/components/BulkCaptionModal';
 import MoveImageModal from '@/components/MoveImageModal';
 import BulkSplitModal from '@/components/BulkSplitModal';
+import BulkReencodeFpsModal from '@/components/BulkReencodeFpsModal';
 import FrameExtractModal from '@/components/FrameExtractModal';
 import FaceExtractModal from '@/components/FaceExtractModal';
 import { TopBar, MainContent } from '@/components/layout';
@@ -58,6 +59,7 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
   const [isBulkCaptionModalOpen, setIsBulkCaptionModalOpen] = useState(false);
   const [isBulkMoveModalOpen, setIsBulkMoveModalOpen] = useState(false);
   const [isBulkSplitModalOpen, setIsBulkSplitModalOpen] = useState(false);
+  const [isBulkReencodeFpsModalOpen, setIsBulkReencodeFpsModalOpen] = useState(false);
   const [isFrameExtractModalOpen, setIsFrameExtractModalOpen] = useState(false);
   const [isFaceExtractModalOpen, setIsFaceExtractModalOpen] = useState(false);
   const [isNotesModalOpen, setIsNotesModalOpen] = useState(false);
@@ -506,6 +508,15 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
                       Extract Frames
                     </Button>
                   )}
+                  {allSelectedAreVideos && (
+                    <Button
+                      className="text-gray-200 bg-blue-700 px-3 py-1 rounded-md flex items-center gap-2"
+                      onClick={() => setIsBulkReencodeFpsModalOpen(true)}
+                    >
+                      <FaTachometerAlt />
+                      Re-encode FPS
+                    </Button>
+                  )}
                   {allSelectedAreImages && (
                     <Button
                       className="text-gray-200 bg-blue-700 px-3 py-1 rounded-md flex items-center gap-2"
@@ -790,6 +801,18 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
           setSelectedImages(new Set());
           setIsBulkSplitModalOpen(false);
           refreshImageList(datasetName);
+        }}
+      />
+      <BulkReencodeFpsModal
+        isOpen={isBulkReencodeFpsModalOpen}
+        onClose={() => setIsBulkReencodeFpsModalOpen(false)}
+        videoPaths={Array.from(selectedImages).filter(p => isVideo(p))}
+        onComplete={() => {
+          setIsSelectMode(false);
+          setSelectedImages(new Set());
+          setIsBulkReencodeFpsModalOpen(false);
+          refreshImageList(datasetName);
+          refreshImageMetadata(datasetName);
         }}
       />
       <FrameExtractModal
