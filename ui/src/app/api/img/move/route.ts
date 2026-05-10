@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
 import { getDatasetsRoot } from '@/server/settings';
+import { getCachePath } from '@/utils/mediaMetadata';
 
 export async function POST(request: Request) {
   try {
@@ -61,6 +62,17 @@ export async function POST(request: Request) {
         fs.renameSync(captionPath, destCaptionPath);
       } else {
         fs.copyFileSync(captionPath, destCaptionPath);
+      }
+    }
+
+    // handle media metadata sidecar (e.g. <name>.meta.json)
+    const metaPath = getCachePath(imgPath);
+    if (fs.existsSync(metaPath)) {
+      const destMetaPath = path.join(destDir, path.basename(metaPath));
+      if (operation === 'move') {
+        fs.renameSync(metaPath, destMetaPath);
+      } else {
+        fs.copyFileSync(metaPath, destMetaPath);
       }
     }
 

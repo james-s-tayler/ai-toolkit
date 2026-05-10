@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import fs from 'fs';
 import { getDatasetsRoot, getTrainingFolder } from '@/server/settings';
+import { getCachePath } from '@/utils/mediaMetadata';
 
 export async function POST(request: Request) {
   try {
@@ -32,6 +33,12 @@ export async function POST(request: Request) {
     if (fs.existsSync(captionPath)) {
       // delete caption file
       fs.unlinkSync(captionPath);
+    }
+
+    // delete media metadata sidecar if it exists
+    const metaPath = getCachePath(imgPath);
+    if (fs.existsSync(metaPath)) {
+      fs.unlinkSync(metaPath);
     }
 
     return NextResponse.json({ success: true });

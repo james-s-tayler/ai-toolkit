@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
 import { getDatasetsRoot, getTrainingFolder } from '@/server/settings';
+import { getCachePath } from '@/utils/mediaMetadata';
 
 export async function POST(request: Request) {
   try {
@@ -41,6 +42,13 @@ export async function POST(request: Request) {
     if (fs.existsSync(trashedCaptionPath)) {
       const restoredCaptionPath = path.join(dir, restoredBasename.replace(/\.[^/.]+$/, '') + '.txt');
       fs.renameSync(trashedCaptionPath, restoredCaptionPath);
+    }
+
+    // restore media metadata sidecar if it exists
+    const trashedMetaPath = getCachePath(imgPath);
+    if (fs.existsSync(trashedMetaPath)) {
+      const restoredMetaPath = getCachePath(restoredPath);
+      fs.renameSync(trashedMetaPath, restoredMetaPath);
     }
 
     return NextResponse.json({ success: true, restoredPath });
