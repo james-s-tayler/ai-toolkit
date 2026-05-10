@@ -10,6 +10,13 @@ import FrameExtractModal from './FrameExtractModal';
 import FaceExtractModal from './FaceExtractModal';
 import { isVideo, isAudio } from '@/utils/basic';
 
+interface DatasetImageCardMetadata {
+  width?: number;
+  height?: number;
+  duration?: number;
+  fps?: number;
+}
+
 interface DatasetImageCardProps {
   imageUrl: string;
   alt: string;
@@ -31,6 +38,7 @@ interface DatasetImageCardProps {
   onSelect?: () => void;
   scoreRefreshKey?: number;
   captionRefreshKey?: number;
+  metadata?: DatasetImageCardMetadata;
 }
 
 const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
@@ -54,6 +62,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   onSelect,
   scoreRefreshKey,
   captionRefreshKey = 0,
+  metadata,
 }) => {
   const cardRef = useRef<HTMLDivElement>(null);
   const [isVisible, setIsVisible] = useState<boolean>(false);
@@ -536,19 +545,42 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
           )}
         </div>
       </div>
-      {scores && Object.keys(scores).length > 0 && (
-        <div className="w-full px-2 py-1 bg-gray-900 rounded-b-lg flex flex-wrap gap-1">
-          {Object.entries(scores).map(([metric, value]) => (
-            <span
-              key={metric}
-              className="text-xs bg-gray-700 text-gray-200 px-2 py-0.5 rounded-full"
-              title={metric}
-            >
-              {metric}: {value.toFixed(2)}
-            </span>
-          ))}
-        </div>
-      )}
+      {(() => {
+        const hasResolution = !!(metadata?.width && metadata?.height);
+        const hasFps = isItAVideo && metadata?.fps !== undefined && metadata.fps > 0;
+        const hasScores = !!scores && Object.keys(scores).length > 0;
+        if (!hasResolution && !hasFps && !hasScores) return null;
+        return (
+          <div className="w-full px-2 py-1 bg-gray-900 rounded-b-lg flex flex-wrap gap-1">
+            {hasResolution && (
+              <span
+                className="text-xs bg-gray-700 text-gray-200 px-2 py-0.5 rounded-full"
+                title="Resolution"
+              >
+                {metadata!.width}×{metadata!.height}
+              </span>
+            )}
+            {hasFps && (
+              <span
+                className="text-xs bg-gray-700 text-gray-200 px-2 py-0.5 rounded-full"
+                title="Framerate"
+              >
+                {Number(metadata!.fps!.toFixed(2))}fps
+              </span>
+            )}
+            {hasScores &&
+              Object.entries(scores!).map(([metric, value]) => (
+                <span
+                  key={metric}
+                  className="text-xs bg-gray-700 text-gray-200 px-2 py-0.5 rounded-full"
+                  title={metric}
+                >
+                  {metric}: {value.toFixed(2)}
+                </span>
+              ))}
+          </div>
+        );
+      })()}
       {isItAVideo && (
         <VideoTrimModal
           videoUrl={imageUrl}

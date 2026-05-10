@@ -1,35 +1,17 @@
 import { NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
-import sharp from 'sharp';
-import { execFile } from 'child_process';
-import { promisify } from 'util';
 import { getDatasetsRoot } from '@/server/settings';
 import { videoExtensions, imgExtensions, audioExtensions } from '@/utils/basic';
-
-const execFileAsync = promisify(execFile);
+import { getMediaMetadata, isCacheFile } from '@/utils/mediaMetadata';
 
 export interface ImageMetadataEntry {
   img_path: string;
   duration?: number;
   width?: number;
   height?: number;
+  fps?: number;
   scores?: Record<string, number>;
-}
-
-async function getVideoDuration(videoPath: string): Promise<number> {
-  try {
-    const { stdout } = await execFileAsync('ffprobe', [
-      '-v', 'error',
-      '-show_entries', 'format=duration',
-      '-of', 'default=noprint_wrappers=1:nokey=1',
-      videoPath,
-    ]);
-    const duration = parseFloat(stdout.trim());
-    return isNaN(duration) ? 0 : duration;
-  } catch {
-    return 0;
-  }
 }
 
 function readScores(imgPath: string): Record<string, number> {
@@ -67,6 +49,7 @@ function findImagesRecursively(dir: string): string[] {
     if (item.isDirectory() && item.name !== '_controls' && !item.name.startsWith('.')) {
       results = results.concat(findImagesRecursively(itemPath));
     } else if (item.isFile()) {
+      if (isCacheFile(item.name)) continue;
       const ext = path.extname(itemPath).toLowerCase();
       if (allExtensions.includes(ext) && !item.name.startsWith('trash_')) {
         results.push(itemPath);
@@ -108,25 +91,17 @@ export async function GET(request: Request) {
     await Promise.all(
       batch.map(async (imgPath, batchIndex) => {
         const index = i + batchIndex;
-        const ext = path.extname(imgPath).toLowerCase();
-        if (videoExtensions.includes(ext)) {
-          const duration = await getVideoDuration(imgPath);
-          images[index] = { img_path: imgPath, duration };
-        } else {
-          const meta: ImageMetadataEntry = { img_path: imgPath };
-          try {
-            const sharpMeta = await sharp(imgPath).metadata();
-            meta.width = sharpMeta.width;
-            meta.height = sharpMeta.height;
-          } catch {
-            // ignore metadata read errors
-          }
-          const scores = readScores(imgPath);
-          if (Object.keys(scores).length > 0) {
-            meta.scores = scores;
-          }
-          images[index] = meta;
+        const meta: ImageMetadataEntry = { img_path: imgPath };
+        const probed = await getMediaMetadata(imgPath);
+        if (probed.width !== undefined) meta.width = probed.width;
+        if (probed.height !== undefined) meta.height = probed.height;
+        if (probed.duration !== undefined) meta.duration = probed.duration;
+        if (probed.fps !== undefined) meta.fps = probed.fps;
+        const scores = readScores(imgPath);
+        if (Object.keys(scores).length > 0) {
+          meta.scores = scores;
         }
+        images[index] = meta;
       }),
     );
   }

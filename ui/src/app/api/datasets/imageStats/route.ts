@@ -1,13 +1,9 @@
 import { NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
-import sharp from 'sharp';
-import { execFile } from 'child_process';
-import { promisify } from 'util';
 import { getDatasetsRoot } from '@/server/settings';
 import { videoExtensions } from '@/utils/basic';
-
-const execFileAsync = promisify(execFile);
+import { getMediaMetadata, isCacheFile } from '@/utils/mediaMetadata';
 
 interface ImageStats {
   totalCount: number;
@@ -15,21 +11,6 @@ interface ImageStats {
   videoCount: number;
   totalVideoDuration: number;
   resolutionBreakdown: { [resolution: string]: number };
-}
-
-async function getVideoDuration(videoPath: string): Promise<number> {
-  try {
-    const { stdout } = await execFileAsync('ffprobe', [
-      '-v', 'error',
-      '-show_entries', 'format=duration',
-      '-of', 'default=noprint_wrappers=1:nokey=1',
-      videoPath,
-    ]);
-    const duration = parseFloat(stdout.trim());
-    return isNaN(duration) ? 0 : duration;
-  } catch {
-    return 0;
-  }
 }
 
 export async function GET(request: Request) {
@@ -67,7 +48,6 @@ export async function GET(request: Request) {
   let videoCount = 0;
   let totalVideoDuration = 0;
   const resolutionBreakdown: { [resolution: string]: number } = {};
-  let hasError = false;
 
   try {
     // Find all images recursively (async to avoid blocking the event loop)
@@ -87,12 +67,13 @@ export async function GET(request: Request) {
     imageCount = nonVideoFiles.length;
     videoCount = videoFiles.length;
 
-    // Get video durations concurrently
     const CONCURRENCY_LIMIT = 10;
+
+    // Get video durations concurrently (cached via shared helper)
     for (let i = 0; i < videoFiles.length; i += CONCURRENCY_LIMIT) {
       const batch = videoFiles.slice(i, i + CONCURRENCY_LIMIT);
-      const durations = await Promise.all(batch.map(vp => getVideoDuration(vp)));
-      totalVideoDuration += durations.reduce((sum, d) => sum + d, 0);
+      const metas = await Promise.all(batch.map(vp => getMediaMetadata(vp)));
+      totalVideoDuration += metas.reduce((sum, m) => sum + (m.duration ?? 0), 0);
     }
 
     // Get resolution for each image with concurrent processing
@@ -100,15 +81,11 @@ export async function GET(request: Request) {
       const batch = nonVideoFiles.slice(i, i + CONCURRENCY_LIMIT);
       await Promise.allSettled(
         batch.map(async imgPath => {
-          try {
-            const metadata = await sharp(imgPath).metadata();
-            const width = metadata.width || 0;
-            const height = metadata.height || 0;
-            const resolution = `${width}x${height}`;
+          const meta = await getMediaMetadata(imgPath);
+          if (meta.width && meta.height) {
+            const resolution = `${meta.width}x${meta.height}`;
             resolutionBreakdown[resolution] = (resolutionBreakdown[resolution] || 0) + 1;
-          } catch (error) {
-            console.error(`Error reading image metadata for ${imgPath}:`, error);
-            // If we can't read the image, count it as unknown
+          } else {
             const unknownKey = 'unknown resolution';
             resolutionBreakdown[unknownKey] = (resolutionBreakdown[unknownKey] || 0) + 1;
           }
@@ -117,7 +94,6 @@ export async function GET(request: Request) {
     }
   } catch (error) {
     console.error('Error calculating image stats:', error);
-    hasError = true;
   }
 
   // Always return stats with what we have, even if there were errors
@@ -159,6 +135,7 @@ async function findImagesRecursively(dir: string): Promise<string[]> {
       if (dirent.isDirectory() && dirent.name !== '_controls' && !dirent.name.startsWith('.')) {
         queue.push(itemPath);
       } else if (dirent.isFile()) {
+        if (isCacheFile(dirent.name)) continue;
         const ext = path.extname(dirent.name).toLowerCase();
         if (imageExtensions.includes(ext) && !dirent.name.startsWith('trash_')) {
           results.push(itemPath);
