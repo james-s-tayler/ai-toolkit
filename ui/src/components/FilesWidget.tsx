@@ -3,8 +3,8 @@ import useFilesList from '@/hooks/useFilesList';
 import Link from 'next/link';
 import { Loader2, AlertCircle, Download, Box, Brain } from 'lucide-react';
 
-export default function FilesWidget({ jobID }: { jobID: string }) {
-  const { files, status, refreshFiles } = useFilesList(jobID, 5000);
+export default function FilesWidget({ apiUrl }: { apiUrl: string }) {
+  const { files, status, refreshFiles } = useFilesList(apiUrl, 5000);
 
   const cleanSize = (size: number) => {
     if (size < 1024) {
@@ -46,7 +46,7 @@ export default function FilesWidget({ jobID }: { jobID: string }) {
           <div className="space-y-1">
             {files.map((file, index) => {
               const fileName = file.path.split('/').pop() || '';
-              const nameWithoutExt = fileName.replace('.safetensors', '');
+              const nameWithoutExt = file.name || fileName.replace('.safetensors', '');
               return (
                 <a
                   key={index}

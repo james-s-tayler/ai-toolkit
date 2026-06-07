@@ -1,0 +1,205 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { PrismaClient } from '@prisma/client';
+import path from 'path';
+import fs from 'fs';
+import { spawn } from 'child_process';
+import { TOOLKIT_ROOT } from '@/paths';
+
+const prisma = new PrismaClient();
+const isWindows = process.platform === 'win32';
+
+function getPythonPath(): string {
+  if (fs.existsSync(path.join(TOOLKIT_ROOT, '.venv'))) {
+    return isWindows
+      ? path.join(TOOLKIT_ROOT, '.venv', 'Scripts', 'python.exe')
+      : path.join(TOOLKIT_ROOT, '.venv', 'bin', 'python');
+  }
+  if (fs.existsSync(path.join(TOOLKIT_ROOT, 'venv'))) {
+    return isWindows
+      ? path.join(TOOLKIT_ROOT, 'venv', 'Scripts', 'python.exe')
+      : path.join(TOOLKIT_ROOT, 'venv', 'bin', 'python');
+  }
+  return 'python';
+}
+
+export async function GET(request: NextRequest, { params }: { params: Promise<{ sessionId: string }> }) {
+  const { sessionId } = await params;
+  try {
+    const runs = await prisma.rlhfTrainingRun.findMany({
+      where: { session_id: sessionId },
+      orderBy: { created_at: 'desc' },
+    });
+    return NextResponse.json({ runs });
+  } catch (error) {
+    console.error(error);
+    return NextResponse.json({ error: 'Failed to fetch training runs' }, { status: 500 });
+  }
+}
+
+export async function POST(request: NextRequest, { params }: { params: Promise<{ sessionId: string }> }) {
+  const { sessionId } = await params;
+  try {
+    const body = await request.json();
+    const {
+      beta = 5000,
+      learning_rate = 1e-5,
+      max_train_steps = 2000,
+      lora_rank = 16,
+      save_every = 250,
+      mixed_precision = 'bf16',
+      gradient_checkpointing = true,
+      quantize = 'none',
+      sample_every = 0,
+      sample_steps = 25,
+      sample_guidance_scale = 3.0,
+      sample_width = 1024,
+      sample_height = 1024,
+      sample_seed = 42,
+      sample_prompts = [] as string[],
+      skip_first_sample = false,
+    } = body;
+
+    const session = await prisma.rlhfSession.findUnique({ where: { id: sessionId } });
+    if (!session) return NextResponse.json({ error: 'Session not found' }, { status: 404 });
+
+    // Get all winning/losing pairs
+    const pairs = await prisma.rlhfPair.findMany({
+      where: {
+        session_id: sessionId,
+        gen_status: 'completed',
+        preference: { in: ['a', 'b'] },
+      },
+    });
+
+    if (pairs.length === 0) {
+      return NextResponse.json({ error: 'No evaluated pairs available for training' }, { status: 400 });
+    }
+
+    const preferences = pairs.map(p => ({
+      prompt: p.prompt,
+      winner_path: p.preference === 'a' ? p.image_a_path : p.image_b_path,
+      loser_path: p.preference === 'a' ? p.image_b_path : p.image_a_path,
+    }));
+
+    const outputDir = path.join(
+      session.output_dir || path.join(TOOLKIT_ROOT, 'data', 'rlhf', session.name),
+      'training'
+    );
+    if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+
+    const prefDataPath = path.join(outputDir, 'preferences.json');
+    fs.writeFileSync(prefDataPath, JSON.stringify(preferences, null, 2));
+
+    const statusFilePath = path.join(outputDir, 'status.json');
+    const controlFilePath = path.join(outputDir, 'control.json');
+    const logPath = path.join(outputDir, 'train.log');
+
+    // Clear any previous control file so a fresh run starts cleanly
+    if (fs.existsSync(controlFilePath)) fs.unlinkSync(controlFilePath);
+
+    const config = {
+      beta,
+      learning_rate,
+      max_train_steps,
+      lora_rank,
+      save_every,
+      mixed_precision,
+      gradient_checkpointing,
+      quantize,
+      sample_every,
+      sample_steps,
+      sample_guidance_scale,
+      sample_width,
+      sample_height,
+      sample_seed,
+      sample_prompts,
+      skip_first_sample,
+    };
+
+    // Write sample prompts file if sampling is enabled
+    let samplePromptsPath = '';
+    if (sample_every > 0 && sample_prompts.length > 0) {
+      samplePromptsPath = path.join(outputDir, 'sample_prompts.json');
+      fs.writeFileSync(samplePromptsPath, JSON.stringify(sample_prompts));
+    }
+
+    const run = await prisma.rlhfTrainingRun.create({
+      data: {
+        session_id: sessionId,
+        status: 'running',
+        config_json: JSON.stringify(config),
+        output_path: outputDir,
+        total_steps: max_train_steps,
+        log_path: logPath,
+      },
+    });
+
+    const pythonPath = getPythonPath();
+    const scriptPath = path.join(TOOLKIT_ROOT, 'scripts', 'rlhf_dpo_train.py');
+
+    // Cache dir lives at session level so it persists across training runs
+    const sessionDir = session.output_dir || path.join(TOOLKIT_ROOT, 'data', 'rlhf', session.name);
+    const cacheDir = path.join(sessionDir, 'cache');
+
+    const args = [
+      scriptPath,
+      '--preference_data', prefDataPath,
+      '--model_path', session.model_path,
+      '--output_dir', outputDir,
+      '--cache_dir', cacheDir,
+      '--status_file', statusFilePath,
+      '--run_id', run.id,
+      '--beta', String(beta),
+      '--learning_rate', String(learning_rate),
+      '--max_train_steps', String(max_train_steps),
+      '--lora_rank', String(lora_rank),
+      '--mixed_precision', mixed_precision,
+      '--save_every', String(save_every),
+      '--quantize', quantize,
+      '--control_file', controlFilePath,
+    ];
+
+    if (gradient_checkpointing) args.push('--gradient_checkpointing');
+
+    if (sample_every > 0) {
+      args.push('--sample_every', String(sample_every));
+      args.push('--sample_steps', String(sample_steps));
+      args.push('--sample_guidance_scale', String(sample_guidance_scale));
+      args.push('--sample_width', String(sample_width));
+      args.push('--sample_height', String(sample_height));
+      args.push('--sample_seed', String(sample_seed));
+      if (samplePromptsPath) {
+        args.push('--sample_prompts_file', samplePromptsPath);
+      }
+      if (skip_first_sample) {
+        args.push('--skip_first_sample');
+      }
+    }
+
+    const additionalEnv: Record<string, string> = {
+      CUDA_DEVICE_ORDER: 'PCI_BUS_ID',
+      CUDA_VISIBLE_DEVICES: session.gpu_ids,
+      PYTHONUNBUFFERED: '1',
+    };
+
+    const logFd = fs.openSync(logPath, 'a');
+    const subprocess = spawn(pythonPath, args, {
+      detached: true,
+      stdio: ['ignore', logFd, logFd],
+      env: { ...process.env, ...additionalEnv },
+      cwd: TOOLKIT_ROOT,
+    });
+
+    subprocess.on('close', () => { fs.closeSync(logFd); });
+    if (subprocess.unref) subprocess.unref();
+
+    const pid = subprocess.pid;
+    await prisma.rlhfTrainingRun.update({ where: { id: run.id }, data: { pid: pid ?? null } });
+    await prisma.rlhfSession.update({ where: { id: sessionId }, data: { status: 'training' } });
+
+    return NextResponse.json(run);
+  } catch (error: any) {
+    console.error(error);
+    return NextResponse.json({ error: 'Failed to start training', details: error?.message || String(error) }, { status: 500 });
+  }
+}

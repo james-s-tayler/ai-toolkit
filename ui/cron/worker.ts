@@ -1,5 +1,6 @@
 import processQueue from './actions/processQueue';
 import processDownloads from './actions/processDownloads';
+import processRlhfGeneration from './actions/processRlhfGeneration';
 class CronWorker {
   interval: number;
   is_running: boolean;
@@ -28,6 +29,7 @@ class CronWorker {
   async loop() {
     await processQueue();
     await processDownloads();
+    await processRlhfGeneration();
   }
 }
 

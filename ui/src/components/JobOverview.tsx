@@ -170,7 +170,7 @@ export default function JobOverview({ job }: JobOverviewProps) {
         <div className="mt-4">{isGPUInfoLoaded && gpuList.length > 0 && <GPUWidget gpu={gpuList[0]} />}</div>
         {jobType === 'train' && (
           <div className="mt-4">
-            <FilesWidget jobID={job.id} />
+            <FilesWidget apiUrl={`/api/jobs/${job.id}/files`} />
           </div>
         )}
       </div>

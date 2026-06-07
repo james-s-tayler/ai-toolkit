@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import { Home, Settings, BrainCircuit, Images, Plus, Trash2, Download, GalleryHorizontalEnd, FileText } from 'lucide-react';
+import { Home, Settings, BrainCircuit, Images, Plus, Trash2, Download, Zap, GalleryHorizontalEnd, FileText } from 'lucide-react';
 import { FaXTwitter, FaDiscord, FaYoutube } from 'react-icons/fa6';
 import ThemeToggle from './ThemeToggle';
 import ThemeLogo from './ThemeLogo';
@@ -8,7 +8,8 @@ const Sidebar = () => {
   const navigation = [
     { name: 'Dashboard', href: '/dashboard', icon: Home },
     { name: 'New Job', href: '/jobs/new', icon: Plus },
-    { name: 'Queue', href: '/jobs', icon: BrainCircuit },
+    { name: 'Training Queue', href: '/jobs', icon: BrainCircuit },
+    { name: 'RLHF / DPO', href: '/rlhf', icon: Zap },
     { name: 'Datasets', href: '/datasets', icon: Images },
     { name: 'Gallery', href: '/gallery', icon: GalleryHorizontalEnd },
     { name: 'Downloads', href: '/downloads', icon: Download },

@@ -31,6 +31,35 @@ function closeDb(db: sqlite3.Database) {
   });
 }
 
+function readJsonlLossLog(
+  jsonlPath: string,
+  key: string,
+  sinceStep: number | null,
+  stride: number,
+  limit: number
+) {
+  const content = fs.readFileSync(jsonlPath, 'utf-8');
+  const points: { step: number; wall_time: number; value: number }[] = [];
+
+  for (const line of content.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line);
+      const step: number = entry.step;
+      const value: number | undefined = entry[key] ?? entry.loss;
+      if (value === undefined || !Number.isFinite(value)) continue;
+      if (sinceStep != null && step <= sinceStep) continue;
+      if (step % stride !== 0) continue;
+      points.push({ step, wall_time: entry.wall_time ?? 0, value });
+      if (points.length >= limit) break;
+    } catch {
+      // skip malformed lines
+    }
+  }
+
+  return points;
+}
+
 export async function GET(request: NextRequest, { params }: { params: { jobID: string } }) {
   // this must be awaited to avoid TS error
   const { jobID } = await params;
@@ -40,11 +69,8 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
 
   const trainingFolder = await getTrainingFolder();
   const jobFolder = path.join(trainingFolder, job.name);
-  const logPath = path.join(jobFolder, 'loss_log.db');
-
-  if (!fs.existsSync(logPath)) {
-    return NextResponse.json({ keys: [], key: 'loss', points: [] });
-  }
+  const dbPath = path.join(jobFolder, 'loss_log.db');
+  const jsonlPath = path.join(jobFolder, 'loss_log.jsonl');
 
   const url = new URL(request.url);
   const key = url.searchParams.get('key') ?? 'loss';
@@ -53,46 +79,60 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
   const sinceStep = sinceStepParam != null ? Number(sinceStepParam) : null;
   const stride = Math.max(1, Number(url.searchParams.get('stride') ?? 1));
 
-  const db = openDb(logPath);
+  // Prefer SQLite database, fall back to JSONL (used by DPO/RLHF training)
+  if (fs.existsSync(dbPath)) {
+    const db = openDb(dbPath);
 
-  try {
-    const keysRows = await all<{ key: string }>(db, `SELECT key FROM metric_keys ORDER BY key ASC`);
-    const keys = keysRows.map((r) => r.key);
+    try {
+      const keysRows = await all<{ key: string }>(db, `SELECT key FROM metric_keys ORDER BY key ASC`);
+      const keys = keysRows.map((r) => r.key);
 
-    const points = await all<{
-      step: number;
-      wall_time: number;
-      value: number | null;
-      value_text: string | null;
-    }>(
-      db,
-      `
-      SELECT
-        m.step AS step,
-        s.wall_time AS wall_time,
-        m.value_real AS value,
-        m.value_text AS value_text
-      FROM metrics m
-      JOIN steps s ON s.step = m.step
-      WHERE m.key = ?
-        AND (? IS NULL OR m.step > ?)
-        AND (m.step % ?) = 0
-      ORDER BY m.step ASC
-      LIMIT ?
-      `,
-      [key, sinceStep, sinceStep, stride, limit]
-    );
+      const points = await all<{
+        step: number;
+        wall_time: number;
+        value: number | null;
+        value_text: string | null;
+      }>(
+        db,
+        `
+        SELECT
+          m.step AS step,
+          s.wall_time AS wall_time,
+          m.value_real AS value,
+          m.value_text AS value_text
+        FROM metrics m
+        JOIN steps s ON s.step = m.step
+        WHERE m.key = ?
+          AND (? IS NULL OR m.step > ?)
+          AND (m.step % ?) = 0
+        ORDER BY m.step ASC
+        LIMIT ?
+        `,
+        [key, sinceStep, sinceStep, stride, limit]
+      );
 
+      return NextResponse.json({
+        key,
+        keys,
+        points: points.map((p) => ({
+          step: p.step,
+          wall_time: p.wall_time,
+          value: p.value ?? (p.value_text ? Number(p.value_text) : null),
+        })),
+      });
+    } finally {
+      await closeDb(db);
+    }
+  }
+
+  if (fs.existsSync(jsonlPath)) {
+    const points = readJsonlLossLog(jsonlPath, key, sinceStep, stride, limit);
     return NextResponse.json({
       key,
-      keys,
-      points: points.map((p) => ({
-        step: p.step,
-        wall_time: p.wall_time,
-        value: p.value ?? (p.value_text ? Number(p.value_text) : null),
-      })),
+      keys: ['loss'],
+      points,
     });
-  } finally {
-    await closeDb(db);
   }
+
+  return NextResponse.json({ keys: [], key, points: [] });
 }
