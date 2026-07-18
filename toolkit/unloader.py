@@ -1,5 +1,7 @@
+import gc
 import torch
 from toolkit.basic import flush
+from toolkit.memory_management import MemoryManager
 from typing import TYPE_CHECKING
 from toolkit.print import print_verbose
 
@@ -25,13 +27,19 @@ class FakeTextEncoder(torch.nn.Module):
     @property
     def device(self):
         return self._device
-    
+
     @property
     def dtype(self):
         return self._dtype
-    
+
     def to(self, *args, **kwargs):
         return self
+
+
+def _detach_and_cpu(te: torch.nn.Module):
+    MemoryManager.detach(te)
+    # bypass any nopped-out .to() override and force an actual CPU move
+    torch.nn.Module.to(te, 'cpu')
 
 
 def unload_text_encoder(model: "BaseModel"):
@@ -50,9 +58,9 @@ def unload_text_encoder(model: "BaseModel"):
             # the pipeline stores text encoders like text_encoder, text_encoder_2, text_encoder_3, etc.
             if hasattr(pipe, "text_encoder"):
                 print_verbose(verbose, f"Unloading text_encoder: moving from {pipe.text_encoder.device} to CPU")
+                _detach_and_cpu(pipe.text_encoder)
                 te = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
                 text_encoder_list.append(te)
-                pipe.text_encoder.to('cpu')
                 print_verbose(verbose, f"text_encoder moved to CPU, replacing with FakeTextEncoder")
                 pipe.text_encoder = te
 
@@ -63,7 +71,7 @@ def unload_text_encoder(model: "BaseModel"):
                 print_verbose(verbose, f"Unloading {te_name}: moving from {te_obj.device} to CPU")
                 te = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
                 text_encoder_list.append(te)
-                te_obj.to('cpu')
+                _detach_and_cpu(te_obj)
                 print_verbose(verbose, f"{te_name} moved to CPU, replacing with FakeTextEncoder")
                 setattr(pipe, te_name, te)
                 i += 1
@@ -72,10 +80,12 @@ def unload_text_encoder(model: "BaseModel"):
         else:
             # only has a single text encoder
             print_verbose(verbose, f"Unloading single text encoder from {model.text_encoder.device}")
-            model.text_encoder = model.text_encoder.to('cpu')
+            _detach_and_cpu(model.text_encoder)
             model.text_encoder = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
             print_verbose(verbose, f"Text encoder moved to CPU and replaced with FakeTextEncoder")
 
+    torch.cuda.empty_cache()
+    gc.collect()
     flush()
     print_verbose(verbose, f"Flushed GPU cache after unloading text encoders")
     print_verbose(verbose, f"unload_text_encoder() completed")
