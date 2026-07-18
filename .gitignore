@@ -190,5 +190,7 @@ aitk_db.db-journal
 
 output/*
 output
-.claude
+# Ignore local Claude config (e.g. settings.local.json) but track shared rules.
+.claude/*
+!.claude/rules/
 .memsearch
