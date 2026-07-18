@@ -15,7 +15,7 @@ import BulkReencodeFpsModal from '@/components/BulkReencodeFpsModal';
 import FrameExtractModal from '@/components/FrameExtractModal';
 import FaceExtractModal from '@/components/FaceExtractModal';
 import { TopBar, MainContent } from '@/components/layout';
-import { apiClient } from '@/utils/api';
+import { apiClient, normalizeListImages } from '@/utils/api';
 import { isAudio, isVideo, formatDuration } from '@/utils/basic';
 import DatasetNotesModal from '@/components/DatasetNotesModal';
 
@@ -93,11 +93,10 @@ export default function DatasetPage({ params }: { params: { datasetName: string 
     apiClient
       .post('/api/datasets/listImages', { datasetName: dbName })
       .then((res: any) => {
-        const data = res.data;
-        console.log('Images:', data.images);
+        const images = normalizeListImages(res.data);
         // sort
-        data.images.sort((a: { img_path: string }, b: { img_path: string }) => a.img_path.localeCompare(b.img_path));
-        setImgList(data.images);
+        images.sort((a, b) => a.img_path.localeCompare(b.img_path));
+        setImgList(images);
         setStatus('success');
       })
       .catch(error => {

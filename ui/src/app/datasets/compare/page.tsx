@@ -7,7 +7,7 @@ import { FaChevronLeft } from 'react-icons/fa';
 import { LuLoader } from 'react-icons/lu';
 import { TopBar, MainContent } from '@/components/layout';
 import CompareView from '@/components/CompareView';
-import { apiClient } from '@/utils/api';
+import { apiClient, normalizeListImages } from '@/utils/api';
 
 interface ImagePair {
   left: string;
@@ -41,9 +41,9 @@ function DatasetCompareContent() {
     setStatus('loading');
 
     const fetches = [
-      apiClient.post('/api/datasets/listImages', { datasetName: left }).then(res => res.data.images as { img_path: string }[]),
-      apiClient.post('/api/datasets/listImages', { datasetName: right }).then(res => res.data.images as { img_path: string }[]),
-      ...(center ? [apiClient.post('/api/datasets/listImages', { datasetName: center }).then(res => res.data.images as { img_path: string }[])] : []),
+      apiClient.post('/api/datasets/listImages', { datasetName: left }).then(res => normalizeListImages(res.data)),
+      apiClient.post('/api/datasets/listImages', { datasetName: right }).then(res => normalizeListImages(res.data)),
+      ...(center ? [apiClient.post('/api/datasets/listImages', { datasetName: center }).then(res => normalizeListImages(res.data))] : []),
     ];
 
     Promise.all(fetches)
