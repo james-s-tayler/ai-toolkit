@@ -493,6 +493,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
             </button>
             <button
               className="bg-gray-800 rounded-full p-2"
+              aria-label="Move image to trash"
               onClick={() => {
                     apiClient
                       .post('/api/img/trash', { imgPath: imageUrl })

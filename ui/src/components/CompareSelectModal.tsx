@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect } from 'react';
 import { Modal } from './Modal';
-import { apiClient } from '@/utils/api';
+import { apiClient, normalizeListImages } from '@/utils/api';
 
 interface CompareSelectModalProps {
   isOpen: boolean;
@@ -51,7 +51,7 @@ const CompareSelectModal: React.FC<CompareSelectModalProps> = ({
   const fetchImages = async (value: string): Promise<string[]> => {
     if (mode === 'dataset') {
       const res = await apiClient.post('/api/datasets/listImages', { datasetName: value });
-      return (res.data.images as { img_path: string }[]).map(i => i.img_path);
+      return normalizeListImages(res.data).map(i => i.img_path);
     } else {
       const res = await apiClient.get(`/api/gallery/images?folderPath=${encodeURIComponent(value)}`);
       return (res.data.images as { img_path: string }[]).map(i => i.img_path);
