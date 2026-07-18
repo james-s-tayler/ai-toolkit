@@ -6,9 +6,9 @@ Personal fork of `ostris/ai-toolkit`. Notes for agents working in this repo.
 
 Start the app via `d-run-safe-ai-toolkit.sh` (on PATH at `/home/me/source/scripts/d-run-safe-ai-toolkit.sh`). It:
 
-- Refuses to run if certain external drives are mounted (safety).
-- Sets up `~/.cache/huggingface` as a symlink to `/media/me/big_monster/.cache/huggingface`.
-- Activates the project venv, `cd`s into `ui/`, and execs `npm run build_and_start`.
+- Refuses to run if certain external drives are mounted (safety): `/media/me/data_nvme01`, `/media/me/data_nvme2`.
+- Requires the model drive to be **mounted** — it `die`s unless `/media/me/big_monster/.cache/huggingface` exists, then sets up `~/.cache/huggingface` as a symlink to it. So a launch can fail even when git/build are green: check this drive is mounted first (`ls /media/me/big_monster/.cache/huggingface`).
+- Activates the project venv (`~/claude_sandbox/ai-toolkit/venv`), `cd`s into `ui/`, and execs `npm run build_and_start` (= `npm install && npm run update_db && npm run build && npm run start`; `update_db` runs `prisma generate` + `db push`, which applies any newly-merged `Job` columns).
 - Runs the whole thing under a systemd user scope named `ai-toolkit.scope` with memory limits.
 
 The UI listens on **port 8675** in this production-style start (`next start --port 8675`). The cron worker runs alongside under `concurrently`.
