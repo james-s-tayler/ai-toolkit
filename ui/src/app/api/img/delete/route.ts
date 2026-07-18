@@ -3,6 +3,8 @@ import fs from 'fs';
 import { getDatasetsRoot, getTrainingFolder } from '@/server/settings';
 import { getCachePath } from '@/utils/mediaMetadata';
 
+const fileExists = (p: string) => fs.promises.access(p).then(() => true).catch(() => false);
+
 export async function POST(request: Request) {
   try {
     const body = await request.json();
@@ -21,18 +23,18 @@ export async function POST(request: Request) {
     }
 
     // if img doesnt exist, ignore
-    if (!fs.existsSync(imgPath)) {
+    if (!(await fileExists(imgPath))) {
       return NextResponse.json({ success: true });
     }
 
     // delete it and return success
-    fs.unlinkSync(imgPath);
+    await fs.promises.unlink(imgPath);
 
     // check for caption
     const captionPath = imgPath.replace(/\.[^/.]+$/, '') + '.txt';
-    if (fs.existsSync(captionPath)) {
+    if (await fileExists(captionPath)) {
       // delete caption file
-      fs.unlinkSync(captionPath);
+      await fs.promises.unlink(captionPath);
     }
 
     // delete media metadata sidecar if it exists
